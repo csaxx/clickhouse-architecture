@@ -10,6 +10,7 @@
    - 3.2 [S3Queue Ingest Path](#32-s3queue-ingest-path)
    - 3.3 [Query Path](#33-query-path)
    - 3.4 [Query Routing Options: K8s Service vs chproxy](#34-query-routing-options-k8s-service-vs-chproxy)
+   - 3.5 [Dedicated Query Cluster: Option Evaluated, Deferred](#35-dedicated-query-cluster-option-evaluated-deferred)
 4. [Storage Policy Design](#4-storage-policy-design)
 5. [Replication and HA Design](#5-replication-and-ha-design)
 6. [Cross-Cluster Write Architecture](#6-cross-cluster-write-architecture)
@@ -268,6 +269,71 @@ The K8s Service targets all cache pods via label selector. Native Kubernetes hea
 | **When to reconsider** | If client concurrency causes CH connection exhaustion, or if per-user query isolation becomes a requirement | — |
 
 chproxy is widely used in production ClickHouse deployments and remains the recommended path if the simpler K8s Service approach hits connection-count or routing limitations.
+
+### 3.5 Dedicated Query Cluster: Option Evaluated, Deferred
+
+**Decision**: Not adopted at this time. Deferred pending PoC evidence. This section documents the evaluation for the record.
+
+#### What the option is
+
+A third cluster — "query" — consisting of 3 compute-only nodes with no replicas. Each node runs only a `Distributed` table targeting the cache cluster. Clients query these nodes instead of cache nodes directly. The query nodes have no local data; they act as dedicated fan-out coordinators and aggregation engines.
+
+#### What it actually does
+
+A query node receives a client query, fans it out to all 7 cache shards via the Distributed table, collects partial results from each shard over the network, and merges them locally. Cache nodes still perform all data scanning and S3/NVMe I/O. The query node handles only coordination and final aggregation.
+
+#### Advantages
+
+**Compute isolation (most significant benefit)**: Cache nodes carry concurrent background load:
+- S3 write-through on every INSERT at ~57,870 rows/sec
+- Background deduplication merges on 500M–1B duplicate rows/day
+- Zero-copy replication coordination with Keeper
+- NVMe cache management
+
+Complex queries requiring large in-memory aggregations compete with merge thread pools for CPU and RAM on cache nodes. Dedicated query nodes remove this contention entirely.
+
+**Independent horizontal scaling**: Query capacity (concurrency, aggregation RAM) scales independently from storage capacity (shard count, NVMe sizing). A 4th query node can be added without touching the cache cluster.
+
+**Hardware specialization**: Query nodes can be provisioned as memory/CPU-heavy without NVMe. Cache nodes can optimize for I/O. Currently both profiles must be satisfied by a single node type.
+
+**Cleaner connection management**: Clients connect to 3 nodes instead of any of 14. Connection pool sizing on the client side is predictable.
+
+#### Disadvantages
+
+**No local data — all 7 shards require network hops**: When a client hits a cache node that also holds shard N data, shard N is scanned locally with no inter-pod network cost (1/7 of data). A query node sends all 7 partial queries over the network, adding inter-pod round-trips for every query.
+
+**Added complexity (most significant cost)**: A third cluster in the CHI means:
+- Additional Kubernetes manifests (StatefulSet, Services, NetworkPolicy, PodDisruptionBudget)
+- The operator must generate correct `remote_servers` for the query cluster referencing the cache cluster — extends the Q12 PoC validation scope
+- Additional upgrade surface: query nodes must match cache node ClickHouse version; rolling upgrades across three clusters are more error-prone
+- Additional monitoring/alerting surfaces
+
+**Weaker HA for query coordination**: Three nodes, no replicas. Any single failure reduces query capacity by 33%. Compare with the current approach where any of 14 cache pods can act as coordinator — losing one has negligible impact.
+
+**Aggregation bottleneck risk**: Under high concurrency, each query node simultaneously aggregates 7 partial result streams per query. If the workload involves many concurrent queries with large intermediate result sets, query nodes become the CPU/RAM bottleneck while cache nodes remain underutilized on the compute side.
+
+**Premature optimization risk**: ClickHouse's scheduler separates background merge threads (`background_pool_size`) from foreground query threads. In practice, these workloads are reasonably isolated. Without PoC evidence of actual contention, the query cluster adds complexity to solve a problem that may not exist at this workload profile.
+
+#### Option comparison
+
+| Dimension | Current (query via cache nodes) | With query cluster |
+|---|---|---|
+| Local data advantage | 1/7 of data local to coordinator | None — all network |
+| Merge/query isolation | Shared CPU/RAM on cache nodes | Fully isolated |
+| Hardware flexibility | One node profile for all | Specialized per role |
+| Horizontal query scaling | Implicit (more cache nodes) | Explicit (query nodes) |
+| Operator/YAML complexity | Two clusters in CHI | Three clusters in CHI |
+| PoC validation scope | Cache + ingest | Cache + ingest + query |
+| Pod count | 19–21 | +3 = 22–24 |
+| HA for query coordination | 14 possible coordinators | 3 nodes, no replicas |
+
+#### Decision rationale
+
+The pattern is architecturally sound and used in production ClickHouse deployments. The timing is wrong.
+
+The Phase 2 PoC (Section 10) already requires measuring sustained throughput at ~29k rows/sec with concurrent merge load. **Extend that PoC run with query-side resource profiling**: measure CPU and memory headroom on cache nodes during representative concurrent queries while the background merge pool is active. If the PoC demonstrates measurable contention — growing merge queue depth, query latency spikes, or cache node memory saturation — the query cluster is the correct architectural response.
+
+If the PoC shows cache nodes handle both workloads within acceptable resource margins, the query cluster adds complexity with no measured gain. Introduce it when evidence of a real bottleneck exists, not before.
 
 ---
 
