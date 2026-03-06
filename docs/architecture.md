@@ -149,7 +149,9 @@ The cache cluster is the **primary persistent storage and query tier**.
 
 **Deduplication**: `ReplicatedReplacingMergeTree` deduplicates rows with the same primary key, keeping the row with the highest value of the `ver` column (typically an event timestamp in milliseconds as `UInt64`, or an incrementing sequence number). The specific column to use as `ver` is TBD — see [Open Question #6](#8-open-questions).
 
-> **Important**: deduplication happens at **merge time**, not at INSERT time. Duplicate rows are transiently visible between insert and the next background merge. Queries requiring fully deduplicated results must use the `SELECT ... FINAL` modifier (forces a merge-on-read; typically 2–3× slower than without `FINAL`) or the `argMax(col, ver) GROUP BY pk` pattern. At 5B rows/day, `FINAL` query performance must be validated in the PoC.
+> **Note**: deduplication happens at **merge time**, not at INSERT time. Duplicate rows are transiently visible between insert and the next background merge. Transient duplicates are acceptable — `SELECT ... FINAL` is not required and should be avoided (it forces a merge-on-read and is typically 2–3× slower).
+
+**Partition key**: `PARTITION BY toYYYYMMDD(event_date)` (daily partitions) is confirmed.
 
 **Storage**: Local NVMe/SSD write-through cache backed by S3 (see [Section 4](#4-storage-policy-design)).
 
@@ -532,41 +534,11 @@ SETTINGS TTL_only_drop_parts = 1
 
 **How `TTL_only_drop_parts = 1` works**: when every row in a data part has an expired TTL, ClickHouse drops the entire part without performing a merge rewrite. This is equivalent to `DROP PARTITION` behavior — **instant physical deletion** of S3 objects for that part.
 
-**24-hour SLA satisfaction**:
-- If `PARTITION BY` is fine-grained (e.g., `toYYYYMMDD(event_date)` — daily partitions) and `TTL_only_drop_parts = 1` is set: parts whose entire content has expired are dropped within the TTL check interval (default: every 60 seconds). This trivially satisfies the 24-hour SLA.
-- If partitioning is too coarse (e.g., monthly), a part may contain a mix of expired and non-expired rows. In that case ClickHouse must do a full merge-rewrite to remove expired rows — which has the same cost as `OPTIMIZE TABLE FINAL`. Fine-grained partitioning avoids this.
+**24-hour SLA satisfaction**: `PARTITION BY toYYYYMMDD(event_date)` (daily partitions) is confirmed and `TTL_only_drop_parts = 1` is set. Parts whose entire content has expired are dropped within the TTL check interval (default: every 60 seconds), trivially satisfying the 24-hour SLA. No manual intervention required.
 
-**Recommendation**: design `PARTITION BY` at day granularity (or partition-aligned with the eviction cycle) and enable `TTL_only_drop_parts = 1`. This makes the TTL expiration path fast, S3-safe, and 24-hour SLA-compliant without any manual intervention.
+**User-ID compliance deletes — sole compliance delete path (confirmed required, high risk at scale)**
 
-#### Physical Deletion SLA: 24 Hours (Confirmed)
-
-The 24-hour physical deletion SLA is a hard constraint. Lightweight DELETE alone does not satisfy it — logical deletion is not physical deletion. Two paths exist:
-
----
-
-**Path A — Partition-aligned compliance deletes (strongly preferred)**
-
-If the compliance DELETE criteria align with the table's partition key (e.g., "delete all data for month M" or "delete data older than date X"):
-
-Use `ALTER TABLE t DROP PARTITION p` instead of lightweight DELETE.
-
-```sql
--- Example: drop a month's data for compliance
-ALTER TABLE cache_table DROP PARTITION '2024-01';
-```
-
-- Execution is instantaneous regardless of data volume.
-- S3 parts for the dropped partition are physically removed immediately — no merge required.
-- Fully compatible with zero-copy replication: Keeper coordinates the partition drop across both replicas.
-- Trivially satisfies the 24-hour physical deletion SLA.
-
-**This is the correct path when the compliance deletion pattern aligns with the partition key. Design `PARTITION BY` to make this possible (see [Open Question #16](#8-open-questions)).**
-
----
-
-**Path B — Row-level cross-partition deletes (confirmed required, high risk at scale)**
-
-User-ID compliance deletes (`DELETE FROM cache_table WHERE user_id = X`) are a confirmed requirement. A given user's rows are distributed across all time partitions — this is non-partition-aligned and Path B is unavoidable.
+User-ID compliance deletes (`DELETE FROM cache_table WHERE user_id = X`) are a confirmed requirement. A given user's rows are distributed across all time partitions — this is non-partition-aligned and row-level delete is unavoidable.
 
 ```sql
 -- Step 1: logical deletion (immediate, but not physical)
@@ -593,22 +565,20 @@ OPTIMIZE TABLE cache_table PARTITION '2024-02' FINAL;
 
 #### Hard Architectural Recommendation
 
-**Design `PARTITION BY` to match the compliance deletion pattern.** This is a DDL design decision that must be made before table creation. If compliance DELETEs always target a time range (e.g., by month, by day), a time-based partition key enables instantaneous `DROP PARTITION` for all compliance operations and eliminates the cost of Path B entirely.
-
-The partition key choice is a prerequisite for finalizing DDL — see [Open Question #16](#8-open-questions).
+**`PARTITION BY toYYYYMMDD(event_date)` (daily) is confirmed.** Daily partitions are the primary mitigation lever for user-ID compliance deletes: each `OPTIMIZE TABLE PARTITION FINAL` call operates on a single day's data per shard, limiting the rows-per-partition that must be rewritten. At ~714M rows/shard/day this is still a heavy operation — but it is the best achievable bound given the non-partition-aligned delete pattern. The PoC must measure the actual elapsed time and S3 I/O per partition to determine whether the 24-hour SLA is feasible (see [Open Question #17](#8-open-questions)).
 
 #### PoC Validation Requirement
 
 The nightly mutation path must be validated in the PoC before production deployment:
 1. Execute a representative nightly DELETE on a partition sized to production data volumes.
-2. Measure the time from DELETE issuance to physical S3 object removal (either via DROP PARTITION or OPTIMIZE TABLE FINAL + GC).
+2. Measure the time from DELETE issuance to physical S3 object removal (OPTIMIZE TABLE FINAL + GC).
 3. Confirm the 24-hour SLA is achievable under production load conditions.
 
 ### 7.4 KafkaEngine At-Least-Once Delivery Risk
 
 KafkaEngine commits the Kafka offset after the Materialized View fires, but the downstream `Distributed` INSERT to the cache cluster can still fail after the offset is committed. This creates a window for data loss (offset advanced, INSERT not persisted).
 
-**Resolution**: `ReplicatedReplacingMergeTree` is confirmed as the cache cluster engine (Q6 resolved). This makes duplicate delivery idempotent: if KafkaEngine re-delivers a message after a failed INSERT (offset not yet committed), the duplicate row is deduplicated at the next background merge. Duplicates are transiently visible until merge; use `SELECT ... FINAL` where deduplication must be guaranteed at query time.
+**Resolution**: `ReplicatedReplacingMergeTree` is confirmed as the cache cluster engine (Q6 resolved). This makes duplicate delivery idempotent: if KafkaEngine re-delivers a message after a failed INSERT (offset not yet committed), the duplicate row is deduplicated at the next background merge. Transient duplicates until merge are acceptable.
 
 **Remaining options for additional safety**:
 - Set `kafka_commit_every_batch = 0` to further reduce the loss window
@@ -648,17 +618,17 @@ The following decisions must be resolved before YAML authoring begins. Each unre
 | 3 | ⬜ | **Keeper deployment method**: `ClickHouseKeeperInstallation` CRD or standalone StatefulSet? Confirm target Altinity operator version and its CRD support. | Keeper YAML |
 | 4 | ⬜ | **Keeper node count**: 3 (tolerates 1 failure) or 5 (tolerates 2 failures)? | Keeper YAML, node reservation |
 | 5 | ⬜ | **Kafka partition strategy**: How many partitions per topic? How are they split between the 2 ingest shards? | KafkaEngine DDL |
-| 6 | ✅ | **Deduplication engine**: `ReplicatedReplacingMergeTree(ver)` confirmed for the cache cluster. Expected duplicate rate: 10–20% (~500M–1B rows/day). Deduplication occurs at merge time; use `SELECT ... FINAL` for guaranteed deduplication at query time. **Sub-question open**: which column to use as `ver` (event timestamp in ms as `UInt64` recommended; specific column TBD). | Cache cluster DDL — engine resolved; `ver` column requires input |
+| 6 | ✅ | **Deduplication engine**: `ReplicatedReplacingMergeTree(ver)` confirmed for the cache cluster. Expected duplicate rate: 10–20% (~500M–1B rows/day). Deduplication occurs at merge time; transient duplicates are acceptable — `SELECT ... FINAL` not required. **Sub-question open**: which column to use as `ver` (event timestamp in ms as `UInt64` recommended; specific column TBD). | Cache cluster DDL — engine resolved; `ver` column requires input |
 | 7 | ✅ | **Sharding key mechanism**: `xxHash64(sharding_column)` confirmed as the distribution mechanism. **Specific column(s) TBD** — which column(s) should be used for the hash? | Distributed table DDL |
 | 8 | ⬜ | **Cache disk sizing**: Target data volume per shard? What percentage of hot data must fit in the NVMe cache? | PVC sizing, storage class selection |
 | 9 | ⬜ | **S3 bucket and prefix naming**: Finalize the bucket name and prefix scheme before any deployment. Renaming after data exists requires a full data migration. | Storage policy YAML |
 | 10 | ⬜ | **CHI namespace strategy**: One `ClickHouseInstallation` per environment (dev/staging/prod), or one CHI across all environments? | CHI YAML structure |
 | 11 | ✅ | **Query routing**: Kubernetes Service load balancing selected. Trade-offs vs chproxy documented in [Section 3.4](#34-query-routing-options-k8s-service-vs-chproxy). | Service/Ingress YAML — can proceed |
-| 12 | ⬜ | **Altinity operator version**: Confirm the exact version available in the target cluster. The cross-cluster `remote_servers` auto-generation behavior must be validated against this version. | CHI YAML, cross-cluster write path |
+| 12 | ✅ | **Altinity operator version**: Confirmed **0.26.0+**. The cross-cluster `remote_servers` auto-generation behavior must still be validated in the PoC against this version before YAML authoring. | CHI YAML, cross-cluster write path — PoC validation required |
 | 13 | ✅ | **S3 credentials management**: HashiCorp Vault with Kubernetes integration. Vault Agent Sidecar pattern selected. Details in [Section 6.4](#64-credential-management-via-hashicorp-vault). | Storage policy YAML, RBAC — design complete; implementation follows deployment |
-| 14 | ✅ | **Mutation policy**: Nightly compliance DELETE and UPDATE confirmed as hard requirement. Lightweight DELETE + DROP PARTITION path (Path A) preferred; 24-hour physical deletion SLA confirmed. Patch parts (lightweight UPDATE) for field-level updates. Full design in [Section 7.3](#73-compliance-mutations-with-zero-copy). Partition key alignment critical — see Q16. | DDL design — PARTITION BY must be finalized before table creation |
+| 14 | ✅ | **Mutation policy**: Nightly compliance DELETE and UPDATE confirmed as hard requirement. Compliance mechanism: lightweight `DELETE WHERE user_id = X` followed by `OPTIMIZE TABLE PARTITION FINAL` per affected partition (sole confirmed path). Patch parts (lightweight UPDATE) for field-level updates. Full design in [Section 7.3](#73-compliance-mutations-with-zero-copy). 24-hour physical deletion SLA feasibility TBD — see Q17. | DDL design — PARTITION BY confirmed daily; SLA validation pending Q17 |
 | 15 | ✅ | **Cache eviction behavior**: LRU eviction is acceptable. Newer data prioritized via write-through (`cache_on_write_operations = 1`). Eviction sizing guidance and monitoring in [Section 4.2](#42-key-storage-settings). | PVC sizing — resolved; start with 20–30% of dataset, tune from hit rate |
-| 16 | ✅ (partial) | **Compliance DELETE paths — now clarified (two components)**: (1) **TTL path** (`eviction_date` column): time-based, potentially partition-aligned. Enable `TTL_only_drop_parts = 1` and fine-grained `PARTITION BY` (e.g., daily) → effectively Path A; instant physical deletion; 24h SLA satisfied. (2) **User-ID path** (`DELETE WHERE user_id = X`): non-partition-aligned, confirmed as a requirement → Path B required. Physical SLA at production volumes is high-risk (see Q17 and [Section 7.3](#73-compliance-mutations-with-zero-copy)). Open blocker: `PARTITION BY` granularity still TBD pending Q17 resolution; must also accommodate TTL alignment. | `PARTITION BY` DDL blocked until Q17 resolved |
+| 16 | ✅ | **Compliance DELETE paths — resolved**: (1) **TTL path** (`eviction_date` column): `TTL_only_drop_parts = 1` with `PARTITION BY toYYYYMMDD(event_date)` (daily) → instant physical deletion; 24h SLA satisfied. (2) **User-ID path** (`DELETE WHERE user_id = X`): non-partition-aligned; lightweight DELETE + `OPTIMIZE TABLE PARTITION FINAL` per partition is the sole path. `PARTITION BY toYYYYMMDD(event_date)` **daily is now confirmed**. Physical SLA at production volumes remains high-risk — see Q17 and [Section 7.3](#73-compliance-mutations-with-zero-copy). | `PARTITION BY` DDL confirmed daily; SLA feasibility pending Q17 |
 | 17 | ⬜ | **User-ID compliance SLA: physical vs logical deletion**. For `DELETE WHERE user_id = X` row-level compliance deletes: does the 24-hour SLA require **physical S3 byte removal** within 24 hours, or is **logical inaccessibility** (deletion bitmap applied; rows invisible to all queries) sufficient? Physical removal at 5B rows/day scale requires `OPTIMIZE TABLE FINAL` across all affected partitions — potentially hundreds or thousands of operations per delete request, taking many hours and competing with ingest. If physical deletion within 24 hours is strictly required, the current table design cannot satisfy it without a dedicated architecture change (e.g., separate per-user TTL partitioning). **This is a legal/compliance determination, not a technical one. The compliance team must provide a formal written answer before DDL is finalized.** | Cache cluster DDL, `PARTITION BY` design, compliance SLA validation |
 
 ---
@@ -668,9 +638,9 @@ The following decisions must be resolved before YAML authoring begins. Each unre
 | Component | Recommended | Minimum | Notes |
 |---|---|---|---|
 | ClickHouse Server | **26.x LTS** | 24.8 | Deployment targets 26.x LTS. Zero-copy replication is stable from 23.8; 26.x is well past all known correctness issues. Always use an LTS release for production. |
-| Altinity Operator | **0.24.x+** | — | Confirm compatibility with ClickHouse 26.x and `ClickHouseKeeperInstallation` CRD support for the exact version available. |
+| Altinity Operator | **0.26.0+** | — | Confirmed version. Validate compatibility with ClickHouse 26.x and `ClickHouseKeeperInstallation` CRD support; validate cross-cluster `remote_servers` auto-generation in PoC. |
 | ClickHouse Keeper | Same as CH Server | — | Keeper is bundled with ClickHouse. Keeper and CH server versions must match exactly. |
-| MinIO (if selected) | **2023+ release** | 2021-09-23 | Strong read-after-write consistency was introduced in the 2021-09-23 release. Earlier versions are incompatible with zero-copy replication. |
+| MinIO (if selected) | **Latest available release** | 2021-09-23 | Strong read-after-write consistency was introduced in the 2021-09-23 release. Earlier versions are incompatible with zero-copy replication. |
 
 ---
 
@@ -696,11 +666,9 @@ Deploy a single cache shard with zero-copy replication enabled. Validate:
 - **Throughput validation** (required at 5B rows/day scale):
   - Drive sustained ingest at ~29,000 rows/sec per shard; confirm no "too many parts" errors occur with `kafka_max_block_size = 1048576`
   - Monitor `system.merges` for merge queue depth under sustained load; tune `background_pool_size` as needed
-  - Measure `SELECT ... FINAL` query latency on a `ReplicatedReplacingMergeTree` table at production row counts; confirm acceptable query performance
 - **Mutation and compliance validation** (required before production):
   - **TTL path**: create a table with `TTL eviction_date DELETE SETTINGS TTL_only_drop_parts = 1`; populate with data where all rows in a part have expired TTL; confirm the part is dropped within the TTL check interval (≤60 sec) and S3 objects are physically removed; verify no rewrite merge is triggered
-  - Execute `ALTER TABLE t DROP PARTITION p` and confirm S3 parts are physically removed immediately (Path A compliance path for non-user-ID criteria)
-  - **Path B load test**: execute lightweight DELETE (`DELETE FROM t WHERE user_id = X`) on a partition sized to representative production volumes; run `OPTIMIZE TABLE PARTITION FINAL`; measure elapsed time and S3 I/O; measure time from DELETE issuance to confirmed physical S3 part removal; document against the 24-hour SLA — this is the primary input for Q17 resolution
+  - **Compliance delete load test**: execute lightweight DELETE (`DELETE FROM t WHERE user_id = X`) on a partition sized to representative production volumes; run `OPTIMIZE TABLE PARTITION FINAL`; measure elapsed time and S3 I/O; measure time from DELETE issuance to confirmed physical S3 part removal; document against the 24-hour SLA — this is the primary input for Q17 resolution
   - If patch parts (lightweight UPDATE) are required for nightly compliance updates: validate `ALTER TABLE t UPDATE` using patch parts with zero-copy enabled; confirm both replicas reflect the update correctly
   - Document all measured timings for inclusion in the compliance evidence package
 
