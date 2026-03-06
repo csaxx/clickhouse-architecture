@@ -5,10 +5,16 @@
 1. [Architecture Overview](#1-architecture-overview)
 2. [Component Descriptions](#2-component-descriptions)
 3. [Data Flow Diagrams](#3-data-flow-diagrams)
+   - 3.1 [Kafka Ingest Path](#31-kafka-ingest-path)
+   - 3.2 [S3Queue Ingest Path](#32-s3queue-ingest-path)
+   - 3.3 [Query Path](#33-query-path)
+   - 3.4 [Query Routing Options: K8s Service vs chproxy](#34-query-routing-options-k8s-service-vs-chproxy)
 4. [Storage Policy Design](#4-storage-policy-design)
 5. [Replication and HA Design](#5-replication-and-ha-design)
 6. [Cross-Cluster Write Architecture](#6-cross-cluster-write-architecture)
+   - 6.4 [Credential Management via HashiCorp Vault](#64-credential-management-via-hashicorp-vault)
 7. [Critical Limitations and Risks](#7-critical-limitations-and-risks)
+   - 7.3 [Compliance Mutations with Zero-Copy](#73-compliance-mutations-with-zero-copy)
 8. [Open Questions](#8-open-questions)
 9. [Recommended Versions](#9-recommended-versions)
 10. [Implementation Order](#10-implementation-order)
@@ -123,7 +129,7 @@ The cache cluster is the **primary persistent storage and query tier**.
 
 ### 2.4 S3 Storage Backend
 
-All persistent data is stored in S3 (MinIO or NetApp S3-compatible storage).
+All persistent data is stored in S3-compatible storage. Two candidates are under evaluation: **MinIO** and **NetApp**. The team must select one before YAML authoring begins (see [Open Question #1](#8-open-questions)).
 
 **Bucket layout**: Single bucket with per-shard prefix:
 ```
@@ -135,7 +141,21 @@ s3://bucket/clickhouse/cache/shard-7/
 
 Both replicas of a shard intentionally write to the same shard prefix. This is required for zero-copy replication: Replica B does not copy data from Replica A — it reads the S3 parts that A already wrote and registers them as its own, coordinating ownership via Keeper.
 
-**Consistency requirement**: Strong read-after-write consistency is required. Both MinIO (post-2021-09-23) and AWS S3 provide this. Verify any other S3-compatible storage provider before deployment.
+**Consistency requirement**: Strong read-after-write consistency is required. Both options below satisfy this requirement at the versions specified.
+
+#### MinIO vs NetApp Comparison
+
+| Dimension | MinIO | NetApp |
+|---|---|---|
+| **Consistency model** | Strong read-after-write consistency from 2021-09-23 release onward | Depends on product (ONTAP S3, StorageGRID); verify per-product docs — strong consistency is generally available but must be confirmed |
+| **HA / erasure coding** | Distributed erasure-coded mode across ≥4 nodes with configurable EC (e.g., EC:4 or EC:2); single-node MinIO is not production-acceptable | Hardware-native redundancy (RAID, HA controllers); erasure coding varies by product line — confirm settings with storage team |
+| **Credential management** | Access key + secret key pairs; supports MinIO service accounts; integrates with HashiCorp Vault via KV secrets engine | Standard S3-compatible access key + secret; credential lifecycle managed by NetApp tooling or Vault |
+| **Vault integration path** | Vault KV or dynamic credentials via MinIO admin API; Vault Agent Sidecar injects creds into CH config at pod start | Vault KV for static access-key storage; no native dynamic-credential provider; same Vault Agent Sidecar injection pattern applies |
+| **Operational complexity** | Operator-managed (Kubernetes MinIO Operator available); team owns the full storage layer | Storage team manages the appliance/cluster; ClickHouse team only manages S3 credentials and bucket configuration |
+| **Cost model** | Infrastructure cost only (runs on commodity nodes) | Licensing + hardware; potentially pre-existing sunk cost if NetApp is already deployed |
+| **ClickHouse PoC risk** | Widely used with ClickHouse zero-copy; well-documented combination | Less community documentation for CH + NetApp; requires explicit PoC validation |
+
+**Recommendation**: If NetApp is already operational in the environment, prefer it to avoid managing an additional storage layer. If no existing S3 infrastructure exists, MinIO distributed mode is the proven path for ClickHouse zero-copy replication.
 
 ---
 
@@ -157,7 +177,7 @@ Kafka Topic (N partitions)
                 └─► Distributed table → cache cluster shards 1-7
 ```
 
-Each cache shard receives rows from both ingest nodes. Rows are distributed by `xxHash64(sharding_key)` so that each row lands on exactly one shard (see [Open Question #7](#8-open-questions)).
+Each cache shard receives rows from both ingest nodes. Rows are distributed by `xxHash64(sharding_column)` — deterministic hashing is confirmed as the mechanism. The specific column(s) to use as the sharding key are TBD (see [Open Question #7](#8-open-questions)).
 
 ### 3.2 S3Queue Ingest Path
 
@@ -179,18 +199,40 @@ Keeper prevents both nodes from processing the same file. File processing state 
 
 ### 3.3 Query Path
 
+**Chosen mechanism**: Kubernetes Service load balancing (see [Section 3.4](#34-query-routing-options-k8s-service-vs-chproxy) for the comparison that led to this decision).
+
 ```
 Client
-  └─► Any cache node (via K8s Service or proxy)
-        └─► cache_distributed (Distributed table, cluster = cache)
-              ├─► Shard 1 (queries one replica)
-              ├─► Shard 2 (queries one replica)
-              │   ...
-              └─► Shard 7 (queries one replica)
-                    └─► Aggregate results → Client
+  └─► K8s Service (ClusterIP or LoadBalancer, port 9000/8123)
+        └─► Any cache node (round-robin or random pod selection)
+              └─► cache_distributed (Distributed table, cluster = cache)
+                    ├─► Shard 1 (queries one replica)
+                    ├─► Shard 2 (queries one replica)
+                    │   ...
+                    └─► Shard 7 (queries one replica)
+                          └─► Aggregate results → Client
 ```
 
 Hot data is served from the local NVMe cache. On a cache miss, the S3 parts are read from S3 and the result is populated into the local NVMe cache for subsequent reads.
+
+The K8s Service targets all cache pods via label selector. Native Kubernetes health checking removes failed pods from the endpoint slice without additional tooling.
+
+### 3.4 Query Routing Options: K8s Service vs chproxy
+
+**Decision**: K8s Service LB selected. This section documents the trade-off evaluation for the record.
+
+| Dimension | K8s Service (chosen) | chproxy |
+|---|---|---|
+| **Operational complexity** | None — native Kubernetes primitive, no extra component to deploy or upgrade | Additional StatefulSet or Deployment; requires HA deployment of chproxy itself |
+| **Health checking** | Kubernetes readiness/liveness probes remove unhealthy pods from endpoints automatically | chproxy has its own health check logic; must be configured separately |
+| **Connection pooling** | None — each client connection goes directly to a CH pod | chproxy pools connections, reducing CH connection overhead under high client concurrency |
+| **Per-user / per-query routing** | Not available — all queries hit any pod | Supports per-user cluster routing, read-only enforcement, and query-level routing rules |
+| **Queue limiting / overflow** | Not available | chproxy can queue or reject queries that exceed concurrency limits |
+| **Protocol support** | TCP (port 9000) and HTTP (port 8123) | HTTP only (proxies ClickHouse HTTP interface) |
+| **TLS termination** | Handled by K8s Ingress or external LB | chproxy can terminate TLS before CH |
+| **When to reconsider** | If client concurrency causes CH connection exhaustion, or if per-user query isolation becomes a requirement | — |
+
+chproxy is widely used in production ClickHouse deployments and remains the recommended path if the simpler K8s Service approach hits connection-count or routing limitations.
 
 ---
 
@@ -216,6 +258,32 @@ The `cache` disk type is a ClickHouse-native write-through cache layer. On INSER
 | `cache_on_write_operations` | `1` | Write-through: INSERTs populate the NVMe cache |
 | `max_size` | TBD | Size of the NVMe PVC — see [Open Question #8](#8-open-questions) |
 | `allow_remote_fs_zero_copy_replication` | `1` | Set in MergeTree settings block; enables zero-copy between replicas |
+
+#### Cache Eviction Strategy
+
+ClickHouse cache disk uses **LRU (Least Recently Used) eviction** by default. The interplay with `cache_on_write_operations = 1` produces the following recency profile:
+
+- **Newest data is always resident**: every INSERT writes through to NVMe immediately. The most recently ingested partitions are always cache-warm.
+- **Actively queried older data stays warm**: LRU retains parts that are being read regularly. Repeated queries on recent-but-not-newest data keep those parts in NVMe.
+- **Eviction triggers only at `max_size`**: when the NVMe PVC approaches its configured limit, the least-recently-used parts are evicted. Evicted data is still readable — ClickHouse transparently fetches from S3 on a cache miss, then re-populates the local cache.
+
+**Sizing guidance**: Target the NVMe cache at the *active working set* — the data expected to be queried regularly. A starting point of 20–30% of total dataset size is reasonable; tune upward based on observed cache hit rate.
+
+**Key monitoring metric**:
+```sql
+SELECT
+    cache_name,
+    formatReadableSize(size)        AS cache_size,
+    formatReadableSize(used_size)   AS used,
+    hits,
+    misses,
+    round(hits / (hits + misses) * 100, 1) AS hit_rate_pct
+FROM system.filesystem_cache_log
+-- or for current state:
+-- FROM system.filesystem_cache
+```
+
+A hit rate below ~90% on hot queries indicates the NVMe cache is undersized for the active working set. Increase `max_size` or reduce the working set by tuning TTL/partition pruning.
 
 ### 4.3 S3 Disk Type
 
@@ -261,10 +329,23 @@ Replication is handled by `ReplicatedMergeTree` coordinated through ClickHouse K
 
 ### 5.3 S3 HA
 
-S3 availability directly governs INSERT availability (write-through). S3 HA must be designed before this architecture can claim full HA:
+S3 availability directly governs INSERT availability (write-through). S3 HA must be designed and validated before this architecture can claim full HA. Requirements differ by backend:
 
-- **MinIO**: requires distributed/erasure-coded mode across multiple nodes and drives. Single-node MinIO is not acceptable for production.
-- **NetApp**: verify erasure-coding and redundancy settings with the storage team.
+**MinIO** (if selected):
+- Must run in distributed erasure-coded mode across a minimum of 4 nodes (MinIO requirement for erasure coding).
+- Recommended configuration: ≥4 nodes with EC:2 or EC:4 depending on drive count and desired fault tolerance.
+- Single-node or single-drive MinIO is not acceptable for production.
+- MinIO itself must have a quorum of nodes available for writes; losing >50% of nodes halts writes.
+- Deploy behind a stable DNS name or K8s Service; ClickHouse connects to MinIO via the configured endpoint in the storage policy XML.
+- See [Open Question #2](#8-open-questions) for MinIO node/drive count decision.
+
+**NetApp** (if selected):
+- Verify that the specific product (ONTAP S3, StorageGRID, etc.) is configured with hardware-level redundancy (RAID, HA controller pairs).
+- Confirm erasure-coding settings with the storage team before PoC.
+- Confirm that the product version provides strong read-after-write consistency on the S3 API path used by ClickHouse.
+- NetApp HA is largely managed by the storage team; the ClickHouse team's responsibility is limited to endpoint stability and credential availability.
+
+**Common requirement for both**: The S3 endpoint must be reachable from all 14 cache pods and both ingest pods on the ports configured in the storage policy (typically 443 for HTTPS or 9000 for MinIO HTTP). Validate K8s NetworkPolicy allows this traffic.
 
 ---
 
@@ -284,7 +365,7 @@ This means ingest nodes automatically know the full shard/replica topology of th
 Kafka partition group
   └─► KafkaEngine on Ingest-0
         └─► Materialized View fires on each batch
-              └─► Distributed table (cluster = "cache", sharding_key = xxHash64(key))
+              └─► Distributed table (cluster = "cache", sharding_key = xxHash64(sharding_column))
                     ├─► INSERT → Cache Shard 1, Replica 0  (writes NVMe + S3)
                     ├─► INSERT → Cache Shard 3, Replica 0
                     └─► ...
@@ -303,6 +384,62 @@ The Altinity operator sets `interserver_secret` automatically for all pods withi
 Keeper pods must be reachable from all cache and ingest pods on:
 - Port **2181** (Keeper client port)
 - Port **2888** / **3888** (Keeper internal cluster ports)
+
+### 6.4 Credential Management via HashiCorp Vault
+
+**Decision**: All secrets are sourced from HashiCorp Vault using the Kubernetes auth method. Kubernetes Secrets are not the primary credential store for this deployment.
+
+#### Credentials Managed by Vault
+
+| Credential | Used by | Vault path (example) |
+|---|---|---|
+| S3 access key + secret | Cache pods (storage policy XML), ingest pods (S3Queue) | `secret/clickhouse/s3/credentials` |
+| ClickHouse user passwords | Client authentication | `secret/clickhouse/users/{username}` |
+| Interserver secret | All CH pods (if not auto-managed by operator) | `secret/clickhouse/interserver` |
+
+For S3 credentials specifically: ClickHouse reads S3 access key and secret key from the storage policy XML at startup (and on SIGHUP). These must be present in the XML config before `clickhouse-server` starts.
+
+#### Vault Injection Patterns
+
+**Option A — Vault Agent Sidecar (recommended for ClickHouse)**
+
+Vault Agent runs as an init container and writes rendered secret templates into a shared volume before the `clickhouse-server` container starts. The rendered output is a ClickHouse XML config drop-in file placed in `/etc/clickhouse-server/config.d/`.
+
+```
+Pod startup sequence:
+  1. vault-agent (init container) authenticates to Vault via K8s ServiceAccount token
+  2. vault-agent renders s3-credentials.xml from Vault KV → /etc/clickhouse-server/config.d/s3-credentials.xml
+  3. clickhouse-server starts, reads config.d/ — S3 creds are already present
+```
+
+Advantage: credentials never exist as a Kubernetes Secret object. Vault Agent handles token renewal. `clickhouse-server` sees static files at startup — no ClickHouse-side Vault awareness needed.
+
+**Option B — Vault Secrets Operator**
+
+The Vault Secrets Operator materializes Vault secrets as Kubernetes Secret objects, which are then mounted into pods as files or environment variables.
+
+Advantage: simpler pod manifest (no sidecar); standard K8s Secret mount pattern.
+
+Disadvantage: credentials exist briefly as Kubernetes Secret objects in etcd. Requires RBAC controls on Secret access. Less appropriate for high-sensitivity credentials.
+
+#### Recommended Pattern
+
+Use **Vault Agent Sidecar** as an init container. Configure it to:
+1. Authenticate using the pod's Kubernetes ServiceAccount via the Vault Kubernetes auth backend.
+2. Render a ClickHouse XML config drop-in file containing S3 access/secret keys.
+3. Write the rendered file to a shared `emptyDir` volume mounted at `/etc/clickhouse-server/config.d/`.
+4. Exit — `clickhouse-server` starts after the init container completes.
+
+#### Secret Rotation Procedure
+
+ClickHouse does not hot-reload S3 credentials automatically when the underlying file changes. To rotate S3 credentials without downtime:
+
+1. Update the secret in Vault.
+2. Vault Agent (if running as a sidecar, not init-only) re-renders the config file on the next renewal cycle.
+3. Send SIGHUP to the `clickhouse-server` process: `kill -HUP $(pidof clickhouse-server)`. ClickHouse reloads XML config files on SIGHUP without restarting.
+4. Verify: query `SELECT * FROM system.disks` and confirm no S3 errors appear in `system.text_log`.
+
+Plan a rotation procedure and test it in staging before the first production credential rotation.
 
 ---
 
@@ -324,14 +461,95 @@ The correct engine for this architecture is `ReplicatedMergeTree` with `allow_re
 
 `s3_plain` uses an immutable flat path layout. `ReplicatedMergeTree` merges write new data parts to new S3 paths. `s3_plain` cannot handle path mutations required by merges. **Always use the standard `s3` disk type**.
 
-### 7.3 Zero-Copy Replication Caveats
+### 7.3 Compliance Mutations with Zero-Copy
+
+Nightly compliance DELETE and UPDATE operations are a confirmed hard requirement. This section documents how both lightweight mutation mechanisms interact with zero-copy replication, the physical deletion timing risk, and the recommended compliance path.
+
+#### General Zero-Copy Caveats
 
 | Risk | Detail | Mitigation |
 |---|---|---|
 | Version requirement | Zero-copy had correctness bugs before 23.x | Mandate ClickHouse 24.x+ for production |
-| Mutations (`UPDATE`/`DELETE`) | `ALTER TABLE UPDATE/DELETE` with zero-copy can produce inconsistency across replicas | Design for INSERT-only workflows; use lightweight deletes (23.3+) cautiously; see [Open Question #14](#8-open-questions) |
 | GC accumulation | Pre-merge S3 parts are GC'd only after all replicas acknowledge the merged part in Keeper. Extended replica downtime causes S3 storage growth | Monitor S3 object count and size; set replica downtime SLA |
 | S3 write amplification from merges | Frequent small merges generate many S3 PUT operations | Tune `min_bytes_for_wide_part`, `merge_max_block_size`, and merge selector settings |
+
+#### Lightweight UPDATE (Patch Parts, CH 24.3+)
+
+Patch parts write a small overlay S3 object that stores the updated column values for affected rows. The original data part on S3 is unchanged; the patch is applied at read time.
+
+- **Zero-copy interaction**: the patch overlay is a new small S3 object. It is replicated to both replicas via Keeper coordination (same mechanism as new data parts). The original part is not rewritten.
+- **S3 write amplification**: low — only the changed columns are written, not the full part.
+- **Production track record**: patch parts alongside zero-copy replication are relatively new (CH 24.3+). **Must be validated in the PoC before relying on them for nightly compliance updates.**
+
+#### Lightweight DELETE (CH 23.3+)
+
+Lightweight DELETE writes a deletion bitmap alongside the data part. Deleted rows are filtered at query execution time and are logically invisible immediately after the DELETE completes.
+
+**Critical gap**: the physical S3 bytes for deleted rows are NOT removed until the data part participates in a merge. Until then, a client with direct S3 access can still read the raw part files.
+
+#### Physical Deletion SLA: 24 Hours (Confirmed)
+
+The 24-hour physical deletion SLA is a hard constraint. Lightweight DELETE alone does not satisfy it — logical deletion is not physical deletion. Two paths exist:
+
+---
+
+**Path A — Partition-aligned compliance deletes (strongly preferred)**
+
+If the compliance DELETE criteria align with the table's partition key (e.g., "delete all data for month M" or "delete data older than date X"):
+
+Use `ALTER TABLE t DROP PARTITION p` instead of lightweight DELETE.
+
+```sql
+-- Example: drop a month's data for compliance
+ALTER TABLE cache_table DROP PARTITION '2024-01';
+```
+
+- Execution is instantaneous regardless of data volume.
+- S3 parts for the dropped partition are physically removed immediately — no merge required.
+- Fully compatible with zero-copy replication: Keeper coordinates the partition drop across both replicas.
+- Trivially satisfies the 24-hour physical deletion SLA.
+
+**This is the correct path when the compliance deletion pattern aligns with the partition key. Design `PARTITION BY` to make this possible (see [Open Question #16](#8-open-questions)).**
+
+---
+
+**Path B — Row-level cross-partition deletes (fallback, expensive)**
+
+If compliance DELETEs target rows by a non-partition column (e.g., delete all rows for `user_id = X` across all time periods):
+
+```sql
+-- Step 1: logical deletion (immediate, but not physical)
+DELETE FROM cache_table WHERE user_id = 12345;
+
+-- Step 2: force physical removal by triggering a merge on every affected partition
+OPTIMIZE TABLE cache_table PARTITION '2024-01' FINAL;
+OPTIMIZE TABLE cache_table PARTITION '2024-02' FINAL;
+-- ... repeat for every partition that contained matching rows
+```
+
+`OPTIMIZE TABLE PARTITION FINAL` rewrites all data parts in a partition into a single merged part, physically removing the deleted rows from S3 in the process.
+
+**Cost of Path B**:
+- `OPTIMIZE TABLE FINAL` reads all parts in the partition from S3, rewrites them, and writes the merged result back — significant CPU, memory, and S3 I/O cost.
+- On 7 shards with large partitions, this is a substantial nightly operation. It must be load-tested on representative data volumes before committing to this approach.
+- Zero-copy compatibility: `OPTIMIZE TABLE FINAL` creates new merged parts on S3; Keeper coordinates GC of old parts after all replicas acknowledge the new part. This is compatible with zero-copy but can be slow on large partitions.
+
+**Timing guarantee**: after `OPTIMIZE TABLE FINAL` completes successfully on all replicas, the old parts enter the Keeper-coordinated GC queue. Allow additional time (typically minutes, not hours) for GC to physically remove the S3 objects. Plan for this lag when calculating against the 24-hour SLA.
+
+---
+
+#### Hard Architectural Recommendation
+
+**Design `PARTITION BY` to match the compliance deletion pattern.** This is a DDL design decision that must be made before table creation. If compliance DELETEs always target a time range (e.g., by month, by day), a time-based partition key enables instantaneous `DROP PARTITION` for all compliance operations and eliminates the cost of Path B entirely.
+
+The partition key choice is a prerequisite for finalizing DDL — see [Open Question #16](#8-open-questions).
+
+#### PoC Validation Requirement
+
+The nightly mutation path must be validated in the PoC before production deployment:
+1. Execute a representative nightly DELETE on a partition sized to production data volumes.
+2. Measure the time from DELETE issuance to physical S3 object removal (either via DROP PARTITION or OPTIMIZE TABLE FINAL + GC).
+3. Confirm the 24-hour SLA is achievable under production load conditions.
 
 ### 7.4 KafkaEngine At-Least-Once Delivery Risk
 
@@ -367,23 +585,26 @@ Write-through caching means S3 is in the critical write path. If S3 becomes unre
 
 The following decisions must be resolved before YAML authoring begins. Each unresolved question blocks one or more YAML files.
 
-| # | Question | Blocks |
-|---|---|---|
-| 1 | **S3 implementation**: MinIO or NetApp S3? | Storage policy YAML, S3 credentials |
-| 2 | **MinIO HA** (if MinIO selected): distributed/erasure-coded mode? How many MinIO nodes and drives? | S3 HA validation |
-| 3 | **Keeper deployment method**: `ClickHouseKeeperInstallation` CRD or standalone StatefulSet? Confirm target Altinity operator version and its CRD support. | Keeper YAML |
-| 4 | **Keeper node count**: 3 (tolerates 1 failure) or 5 (tolerates 2 failures)? | Keeper YAML, node reservation |
-| 5 | **Kafka partition strategy**: How many partitions per topic? How are they split between the 2 ingest shards? | KafkaEngine DDL |
-| 6 | **Exactly-once semantics**: Use `ReplacingMergeTree` on the cache cluster for deduplication, or accept at-least-once delivery? | Cache cluster DDL |
-| 7 | **Sharding key**: Which column(s) to use for `xxHash64()` in the Distributed table, or use `rand()`? | Distributed table DDL |
-| 8 | **Cache disk sizing**: Target data volume per shard? What percentage of hot data must fit in the NVMe cache? | PVC sizing, storage class selection |
-| 9 | **S3 bucket and prefix naming**: Finalize the bucket name and prefix scheme before any deployment. Renaming after data exists requires a full data migration. | Storage policy YAML |
-| 10 | **CHI namespace strategy**: One `ClickHouseInstallation` per environment (dev/staging/prod), or one CHI across all environments? | CHI YAML structure |
-| 11 | **Query routing**: Direct pod connection, Kubernetes Service load balancing, or a query proxy (e.g., chproxy)? | Service/Ingress YAML |
-| 12 | **Altinity operator version**: Confirm the exact version available in the target cluster. The cross-cluster `remote_servers` auto-generation behavior must be validated against this version. | CHI YAML, cross-cluster write path |
-| 13 | **S3 credentials management**: Kubernetes Secrets, IAM instance roles/IRSA, or MinIO service accounts? | Storage policy YAML, RBAC |
-| 14 | **Mutation policy**: Are any `ALTER TABLE UPDATE` or `DELETE` operations expected? If yes, zero-copy + mutation interaction must be evaluated and tested before production use. | DDL design |
-| 15 | **Cache eviction behavior**: Is cache-miss fallback to S3-only reads acceptable for evicted data, or must the NVMe cache be sized large enough to prevent eviction of hot data entirely? | PVC sizing |
+**Legend**: ✅ Resolved | ⬜ Open
+
+| # | Status | Question | Blocks |
+|---|---|---|---|
+| 1 | ✅ | **S3 implementation**: Both MinIO and NetApp are under evaluation. See comparison in [Section 2.4](#24-s3-storage-backend) and [Section 5.3](#53-s3-ha). Decision required before storage policy YAML. | Storage policy YAML, S3 credentials |
+| 2 | ⬜ | **MinIO HA** (if MinIO selected): distributed/erasure-coded mode? How many MinIO nodes and drives? | S3 HA validation |
+| 3 | ⬜ | **Keeper deployment method**: `ClickHouseKeeperInstallation` CRD or standalone StatefulSet? Confirm target Altinity operator version and its CRD support. | Keeper YAML |
+| 4 | ⬜ | **Keeper node count**: 3 (tolerates 1 failure) or 5 (tolerates 2 failures)? | Keeper YAML, node reservation |
+| 5 | ⬜ | **Kafka partition strategy**: How many partitions per topic? How are they split between the 2 ingest shards? | KafkaEngine DDL |
+| 6 | ⬜ | **Exactly-once semantics**: Use `ReplacingMergeTree` on the cache cluster for deduplication, or accept at-least-once delivery? | Cache cluster DDL |
+| 7 | ✅ | **Sharding key mechanism**: `xxHash64(sharding_column)` confirmed as the distribution mechanism. **Specific column(s) TBD** — which column(s) should be used for the hash? | Distributed table DDL |
+| 8 | ⬜ | **Cache disk sizing**: Target data volume per shard? What percentage of hot data must fit in the NVMe cache? | PVC sizing, storage class selection |
+| 9 | ⬜ | **S3 bucket and prefix naming**: Finalize the bucket name and prefix scheme before any deployment. Renaming after data exists requires a full data migration. | Storage policy YAML |
+| 10 | ⬜ | **CHI namespace strategy**: One `ClickHouseInstallation` per environment (dev/staging/prod), or one CHI across all environments? | CHI YAML structure |
+| 11 | ✅ | **Query routing**: Kubernetes Service load balancing selected. Trade-offs vs chproxy documented in [Section 3.4](#34-query-routing-options-k8s-service-vs-chproxy). | Service/Ingress YAML — can proceed |
+| 12 | ⬜ | **Altinity operator version**: Confirm the exact version available in the target cluster. The cross-cluster `remote_servers` auto-generation behavior must be validated against this version. | CHI YAML, cross-cluster write path |
+| 13 | ✅ | **S3 credentials management**: HashiCorp Vault with Kubernetes integration. Vault Agent Sidecar pattern selected. Details in [Section 6.4](#64-credential-management-via-hashicorp-vault). | Storage policy YAML, RBAC — design complete; implementation follows deployment |
+| 14 | ✅ | **Mutation policy**: Nightly compliance DELETE and UPDATE confirmed as hard requirement. Lightweight DELETE + DROP PARTITION path (Path A) preferred; 24-hour physical deletion SLA confirmed. Patch parts (lightweight UPDATE) for field-level updates. Full design in [Section 7.3](#73-compliance-mutations-with-zero-copy). Partition key alignment critical — see Q16. | DDL design — PARTITION BY must be finalized before table creation |
+| 15 | ✅ | **Cache eviction behavior**: LRU eviction is acceptable. Newer data prioritized via write-through (`cache_on_write_operations = 1`). Eviction sizing guidance and monitoring in [Section 4.2](#42-key-storage-settings). | PVC sizing — resolved; start with 20–30% of dataset, tune from hit rate |
+| 16 | ⬜ | **Partition key alignment with compliance DELETE criteria**: Do the nightly compliance DELETEs target rows by the partition key (e.g., delete by time range → enables `DROP PARTITION`, instant + zero-copy safe) or by a non-partition column (e.g., delete by `user_id` across all partitions → requires expensive `OPTIMIZE TABLE FINAL` on each partition)? This determines whether Path A or Path B is viable and directly controls `PARTITION BY` DDL design. **Must be answered before table DDL can be written.** | Cache cluster DDL, `PARTITION BY` clause, compliance SLA validation |
 
 ---
 
@@ -417,6 +638,11 @@ Deploy a single cache shard with zero-copy replication enabled. Validate:
 - S3 parts appear under the correct shard prefix
 - NVMe cache is populated on write (`cache_on_write_operations = 1`)
 - Cache miss triggers S3 read and local cache population
+- **Mutation validation** (required before production):
+  - Execute `ALTER TABLE t DROP PARTITION p` and confirm S3 parts are physically removed immediately (Path A compliance path)
+  - If Path B is required: execute lightweight DELETE followed by `OPTIMIZE TABLE PARTITION FINAL`; measure time from DELETE issuance to confirmed physical S3 part removal; verify the 24-hour SLA is achievable at representative partition sizes
+  - If patch parts (lightweight UPDATE) are required for nightly compliance updates: validate `ALTER TABLE t UPDATE` using patch parts (CH 24.3+) with zero-copy enabled; confirm both replicas reflect the update correctly
+  - Document measured timings for inclusion in the compliance evidence package
 
 **Phase 3 — Scale cache cluster to full topology (7 shards × 2 replicas)**
 Roll out the remaining 6 shards. Validate `cache_distributed` fan-out queries.
