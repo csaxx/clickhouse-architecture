@@ -19,6 +19,7 @@
 8. [Open Questions](#8-open-questions)
 9. [Recommended Versions](#9-recommended-versions)
 10. [Implementation Order](#10-implementation-order)
+11. [Table and Engine Configuration Reference](#11-table-and-engine-configuration-reference)
 
 ---
 
@@ -683,3 +684,19 @@ Create ingest tables and views. Validate end-to-end: messages from Kafka and fil
 
 **Phase 6 — Distributed query table + client connectivity**
 Expose `cache_distributed` to clients via the chosen routing mechanism (Service, chproxy, etc.). Run query validation.
+
+---
+
+## 11. Table and Engine Configuration Reference
+
+Annotated DDL templates and server configuration baselines for all table types are in the companion document:
+
+**[docs/configuration-reference.md](configuration-reference.md)**
+
+| Section | Contents |
+|---|---|
+| [§1 — Database Engine: `Replicated` vs Default](configuration-reference.md#1-database-engine-replicated-vs-default) | Comparison of `Replicated` vs `Atomic` + `ON CLUSTER`; recommendation per cluster |
+| [§2 — Cache Cluster Tables](configuration-reference.md#2-cache-cluster-tables) | `ReplicatedReplacingMergeTree` DDL; `Distributed` query table DDL |
+| [§3 — Ingest Cluster Tables](configuration-reference.md#3-ingest-cluster-tables) | `KafkaEngine`, `S3Queue`, Materialized Views, write `Distributed` table DDL |
+| [§4 — Global Server Settings](configuration-reference.md#4-global-server-settings) | Cache node and ingest node XML config baselines |
+| [§5 — Cache Disk Sizing](configuration-reference.md#5-cache-disk-sizing) | Sizing formula, worked examples (50–200 B/row × 30–90 day retention), storage XML |
