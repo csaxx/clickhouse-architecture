@@ -1,0 +1,643 @@
+# ClickHouseInstallation — single CHI for ingest (2×1) + cache (7×2) clusters
+#
+# Altinity operator 0.26.0+
+# CRD: clickhouse.altinity.com/v1
+#
+# Architecture reference: docs/architecture.md
+# Configuration reference: docs/configuration-reference.md
+#
+# ─── PREREQUISITES ────────────────────────────────────────────────────────────
+# 1. Keeper deployed and quorum healthy (01-keeper.yaml)
+# 2. Vault Agent Injector running (vault/serviceaccount.yaml applied)
+# 3. StorageClass "nvme-storageclass" exists and provisions NVMe-backed PVs
+# 4. StorageClass "standard" exists for metadata / WAL volumes
+# 5. Node labels applied:
+#      clickhouse/role=cache   on ≥14 dedicated NVMe cache nodes
+#      clickhouse/role=ingest  on ≥2 ingest nodes
+#
+# ─── OPEN DECISION PLACEHOLDERS ───────────────────────────────────────────────
+# Q1/Q9  Replace <S3_ENDPOINT_URL> and <S3_BUCKET> with the actual S3 endpoint
+#        and bucket name (finalize before PoC — renaming after data exists requires
+#        a full data migration; architecture.md §9 Decision #9).
+# Q8     Replace 300Gi (nvme-cache-pvc) and 274877906944 (max_size in bytes = 256 GiB)
+#        with values computed from docs/configuration-reference.md §5.
+#        Formula: PVC = nvme_cache_target × 1.15; max_size = nvme_cache_target.
+# Vault  Replace "secret/data/clickhouse/s3/credentials" and role "clickhouse-cache"
+#        with your Vault KV path and role name (vault/vault-policy.hcl).
+# Sizes  CPU/memory requests and limits are starting points for PoC load testing.
+#        Tune based on observed utilization before production sizing.
+#
+# ─── CRITICAL WARNINGS ────────────────────────────────────────────────────────
+# - S3 disk type MUST be "s3" — NOT "s3_plain".
+#   s3_plain uses an immutable layout incompatible with ReplicatedMergeTree merges.
+#   (architecture.md §8.2, §5.4)
+# - SharedMergeTree is NOT used. Engine is ReplicatedReplacingMergeTree.
+#   SharedMergeTree is ClickHouse Cloud only; using it on open-source CH produces
+#   "Unknown table engine 'SharedMergeTree'" (architecture.md §8.1).
+# - Validate cross-cluster remote_servers auto-generation against your operator
+#   version in the PoC before relying on it in production (architecture.md §7.1).
+
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: clickhouse-production
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of: clickhouse-production
+spec:
+
+  # ─── DEFAULTS ──────────────────────────────────────────────────────────────
+  defaults:
+    replicasUseFQDN: 1
+    distributedDDL:
+      profile: default
+    templates:
+      serviceTemplate: chi-service
+
+  # ─── CONFIGURATION ─────────────────────────────────────────────────────────
+  configuration:
+
+    # ─── Keeper connection ──────────────────────────────────────────────────
+    # The Altinity operator generates the <zookeeper> XML block from this section
+    # and distributes it to every pod in the CHI.
+    # Individual pod DNS addresses (via CHKI headless service) are listed so the
+    # ClickHouse ZK client can try each node independently on failure.
+    # Validate the headless service name against your CHKI deployment:
+    #   kubectl -n clickhouse get svc -l app.kubernetes.io/component=keeper
+    zookeeper:
+      nodes:
+        - host: clickhouse-keeper-0.clickhouse-keeper-headless.clickhouse.svc.cluster.local
+          port: 2181
+        - host: clickhouse-keeper-1.clickhouse-keeper-headless.clickhouse.svc.cluster.local
+          port: 2181
+        - host: clickhouse-keeper-2.clickhouse-keeper-headless.clickhouse.svc.cluster.local
+          port: 2181
+        - host: clickhouse-keeper-3.clickhouse-keeper-headless.clickhouse.svc.cluster.local
+          port: 2181
+        - host: clickhouse-keeper-4.clickhouse-keeper-headless.clickhouse.svc.cluster.local
+          port: 2181
+      session_timeout_ms:   30000
+      operation_timeout_ms: 10000
+
+    # ─── Global user profiles ───────────────────────────────────────────────
+    # Applied to all pods in both clusters via the <profiles> XML block.
+    # Per-query memory budget and INSERT deduplication are shared requirements.
+    profiles:
+      # Per-query memory limit. 10 GiB is a conservative starting point.
+      # Tune upward if heavy aggregation queries are observed OOM-killing;
+      # tune downward if per-query memory saturation causes node-level pressure.
+      default/max_memory_usage: "10737418240"
+
+      # Disk-spill thresholds — allow large GROUP BY / ORDER BY to spill to disk
+      # rather than failing with memory limit exceeded.
+      default/max_bytes_before_external_group_by: "5368709120"
+      default/max_bytes_before_external_sort:     "5368709120"
+
+      # INSERT-level deduplication for ReplicatedMergeTree tables.
+      # Tracks recent INSERT block checksums; rejects re-delivered Kafka batches
+      # with the same block checksum. Primary guard against KafkaEngine
+      # at-least-once re-delivery duplicating data parts (architecture.md §7.4).
+      # Do NOT disable.
+      default/insert_deduplicate: "1"
+
+    # ─── CLUSTERS ──────────────────────────────────────────────────────────
+
+    clusters:
+
+      # ══════════════════════════════════════════════════════════════════════
+      # INGEST CLUSTER — 2 shards × 1 replica
+      #
+      # Stateless compute tier. Hosts:
+      #   - KafkaEngine tables (one per shard, unique kafka_group_name per shard)
+      #   - S3Queue tables (Keeper coordinates file claims across both nodes)
+      #   - Materialized Views (transform + forward to cache cluster)
+      #   - Distributed write table (cache_writer → cache cluster)
+      #
+      # No S3 backend. No NVMe cache disk. Default storage policy (local disk only).
+      # Data is not retained locally; all rows are immediately forwarded to cache.
+      # ══════════════════════════════════════════════════════════════════════
+      - name: ingest
+        layout:
+          shardsCount:   2
+          replicasCount: 1
+
+        # Per-cluster server settings for ingest nodes.
+        # (configuration-reference.md §4 — Ingest Node Settings)
+        settings:
+          # KafkaEngine and S3Queue polling scheduler threads.
+          # Each KafkaEngine table with kafka_num_consumers=1 uses 1 thread.
+          # Each S3Queue table uses s3queue_processing_threads_num threads.
+          # 16 provides headroom for 2 Kafka + 2 S3Queue tables per node.
+          background_message_broker_schedule_pool_size: "16"
+
+          # Distributed table async send threads.
+          # Used only in async INSERT mode. Set to 0 if insert_distributed_sync=1
+          # is configured in the ingest user profile.
+          background_distributed_schedule_pool_size: "8"
+
+          # Merge threads. Ingest nodes hold no persistent user data; minimal merges.
+          # 4 covers transient local parts before MV fires.
+          background_pool_size: "4"
+
+          # Memory cap. Ingest nodes are primarily I/O-bound (Kafka polling + S3 reads).
+          # 80% leaves OS headroom for network buffers and S3 HTTP connections.
+          max_server_memory_usage_to_ram_ratio: "0.80"
+
+          max_connections:         "1024"
+          max_concurrent_queries:  "100"
+
+        templates:
+          podTemplate:            ingest-pod
+          dataVolumeClaimTemplate: ingest-data-pvc
+          serviceTemplate:        cluster-internal-service
+
+      # ══════════════════════════════════════════════════════════════════════
+      # CACHE CLUSTER — 7 shards × 2 replicas
+      #
+      # Persistent storage and query tier. Hosts:
+      #   - ReplicatedReplacingMergeTree(ver) — dedup at merge time
+      #   - Distributed query table (cache_distributed) — fan-out to all 7 shards
+      #
+      # Storage: NVMe write-through cache (type: cache) wrapping S3 (type: s3).
+      # Zero-copy replication: allow_remote_fs_zero_copy_replication = 1.
+      # Both replicas of a shard write to the same S3 prefix (intentional).
+      # ══════════════════════════════════════════════════════════════════════
+      - name: cache
+        layout:
+          shardsCount:   7
+          replicasCount: 2
+
+        # Per-cluster server settings for cache nodes.
+        # (configuration-reference.md §4 — Cache Node Settings)
+        settings:
+          # Merge and mutation threads.
+          # At ~714M rows/shard/day with 10–20% dedup pressure from
+          # ReplacingMergeTree, plus nightly compliance DELETE mutations,
+          # 16 threads sustains concurrent merge activity without queue backlog.
+          # Increase to 32 if system.merges shows persistent queue depth > 100.
+          background_pool_size: "16"
+
+          # Replication fetch threads.
+          # With zero-copy replication, replicas reference the same S3 parts rather
+          # than copying bytes. These threads are used mainly during replica catch-up
+          # after pod restart. 8 is sufficient for a 2-replica-per-shard topology.
+          background_fetches_pool_size: "8"
+
+          # Scheduled background tasks: TTL checks, replica health, part moves.
+          # 16 provides headroom for concurrent nightly TTL drops alongside
+          # normal merge activity.
+          background_schedule_pool_size: "16"
+
+          # Part movement between storage volumes.
+          # Minimal relevance for single write-through policy (no tiered volumes).
+          background_move_pool_size: "4"
+
+          # Server memory cap at 85% of RAM.
+          # Leaves headroom for OS page cache, which is critical for NVMe cache
+          # hit performance. Do not exceed 90%.
+          max_server_memory_usage_to_ram_ratio: "0.85"
+
+          max_connections:              "4096"
+          max_concurrent_queries:       "200"
+          max_concurrent_insert_queries: "50"
+
+        # Per-cluster config files for cache nodes only.
+        # These are mounted only on cache pods — ingest pods do not receive them.
+        files:
+
+          # ─── Storage configuration ────────────────────────────────────────
+          # S3 disk (type: s3) + NVMe write-through cache layer (type: cache).
+          #
+          # {shard} is a ClickHouse macro. The Altinity operator sets the <macros>
+          # section per-pod ({shard}, {replica}, {cluster}) so ClickHouse expands
+          # {shard} at startup, giving each pod a unique S3 prefix.
+          #
+          # S3 credentials are NOT embedded here. The Vault Agent init container
+          # (triggered by pod template annotations below) writes s3-credentials.xml
+          # into /etc/clickhouse-server/config.d/ before clickhouse-server starts.
+          # ClickHouse merges all config.d/ files; the two disk config fragments
+          # cooperate to produce the complete s3_main disk configuration.
+          #
+          # TBD (Q1, Q9): Replace <S3_ENDPOINT_URL> and <S3_BUCKET>.
+          # TBD (Q8):     Replace max_size with computed nvme_cache_target.
+          #               Example: 256 GiB = 274877906944 bytes.
+          #               See docs/configuration-reference.md §5 for sizing formula.
+          "config.d/storage.xml": |
+            <clickhouse>
+                <storage_configuration>
+                    <disks>
+                        <!--
+                            Primary S3 disk.
+                            Type MUST be "s3" — NOT "s3_plain".
+                            s3_plain uses an immutable flat-path layout that is
+                            incompatible with ReplicatedMergeTree merges (new parts
+                            are written to new S3 paths, which s3_plain cannot manage).
+                            (architecture.md §8.2, §5.4)
+
+                            {shard} macro: populated by Altinity operator per-pod.
+                            Result: each shard gets a unique S3 prefix, preventing
+                            cross-shard part collisions.
+                            Both replicas of a shard intentionally share the same prefix.
+                            This is required for zero-copy: Replica B does not copy bytes
+                            from Replica A — it reads S3 parts that A already wrote and
+                            registers them via Keeper. (architecture.md §6.1)
+                        -->
+                        <s3_main>
+                            <type>s3</type>
+                            <endpoint>https://<S3_ENDPOINT_URL>/<S3_BUCKET>/clickhouse/cache/shard-{shard}/</endpoint>
+
+                            <!--
+                                Credentials injected by Vault Agent Sidecar at pod start.
+                                The init container writes:
+                                  /etc/clickhouse-server/config.d/s3-credentials.xml
+                                That file provides <access_key_id> and <secret_access_key>
+                                for this disk. ClickHouse merges both config.d/ fragments.
+                                (architecture.md §7.4)
+                            -->
+                            <use_environment_credentials>false</use_environment_credentials>
+
+                            <!-- Local path for S3 part metadata (not the data itself). -->
+                            <metadata_path>/var/lib/clickhouse/disks/s3_main/</metadata_path>
+
+                            <!-- S3 multi-part upload threshold (5 MiB default). -->
+                            <min_upload_part_size>5242880</min_upload_part_size>
+
+                            <!-- Parallel S3 upload threads per part. -->
+                            <max_single_part_upload_size>33554432</max_single_part_upload_size>
+                        </s3_main>
+
+                        <!--
+                            NVMe write-through cache layer.
+                            Wraps s3_main: on INSERT, data is written simultaneously to
+                            NVMe (local) and S3. On read, NVMe copy is served if present;
+                            on cache miss, S3 part is fetched and populated into NVMe.
+                            LRU eviction when used_size approaches max_size.
+                            (architecture.md §5.1, §5.3)
+                        -->
+                        <nvme_cache>
+                            <type>cache</type>
+                            <disk>s3_main</disk>
+
+                            <!--
+                                Path on the NVMe PVC.
+                                Mount path of nvme-cache-pvc in the pod template below
+                                MUST match this path exactly.
+                            -->
+                            <path>/var/lib/clickhouse/s3_cache/</path>
+
+                            <!--
+                                TBD (Q8): Replace with computed nvme_cache_target.
+                                Current placeholder: 256 GiB = 274877906944 bytes.
+                                Sizing formula in docs/configuration-reference.md §5.
+                                PVC size (nvme-cache-pvc) must be max_size × 1.15.
+                                ClickHouse LRU-evicts at max_size; PVC headroom prevents
+                                the underlying filesystem from filling.
+                            -->
+                            <max_size>274877906944</max_size>
+
+                            <!-- Write-through: populate NVMe cache on every INSERT. -->
+                            <cache_on_write_operations>1</cache_on_write_operations>
+
+                            <!-- 100 MiB cache segment files. -->
+                            <max_file_segment_size>104857600</max_file_segment_size>
+
+                            <!-- Cache on first access. Increase to 1–2 to avoid
+                                 caching rarely-read cold parts. -->
+                            <cache_hits_threshold>0</cache_hits_threshold>
+                        </nvme_cache>
+                    </disks>
+
+                    <policies>
+                        <!--
+                            Single-volume policy used by cache_table DDL:
+                              SETTINGS storage_policy = 'cache_policy'
+                            All writes go to nvme_cache (which transparently writes
+                            through to s3_main).
+                        -->
+                        <cache_policy>
+                            <volumes>
+                                <main>
+                                    <disk>nvme_cache</disk>
+                                </main>
+                            </volumes>
+                        </cache_policy>
+                    </policies>
+                </storage_configuration>
+            </clickhouse>
+
+          # ─── MergeTree settings (cache cluster) ───────────────────────────
+          # (configuration-reference.md §4 — Cache Node Settings)
+          "config.d/merge-tree-settings.xml": |
+            <clickhouse>
+                <merge_tree>
+                    <!--
+                        Parts-before-INSERT-slowdown (default 300).
+                        With kafka_max_block_size = 1048576, ~1 new part per ~35 s under
+                        normal load. This limit serves as a safety backstop only.
+                        (architecture.md §1.2 — part accumulation constraint)
+                    -->
+                    <parts_to_delay_insert>300</parts_to_delay_insert>
+
+                    <!--
+                        Parts-before-INSERT-rejection. Lowered from default 3000 to 1000
+                        as an early warning threshold.
+                        At 1000 parts the merge system is severely behind; catching it here
+                        allows investigation before the hard limit blocks all INSERTs.
+                    -->
+                    <parts_to_throw_insert>1000</parts_to_throw_insert>
+
+                    <!-- Hard limit on total active parts across all partitions on this pod. -->
+                    <max_parts_in_total>200000</max_parts_in_total>
+
+                    <!--
+                        Minimum interval between TTL-triggered merge checks per partition.
+                        Default: 14400 s (4 hours). Set to 60 s for prompt expired-part drops.
+                        Combined with TTL_only_drop_parts = 1 in table DDL, this ensures
+                        fully-expired partitions are dropped within 60 s of the TTL check,
+                        providing substantial margin against the 24-hour TTL SLA.
+                        (architecture.md §8.3 — TTL-based expiration)
+                        Increase to 3600 if TTL merge activity competes with ingest load.
+                    -->
+                    <merge_with_ttl_timeout>60</merge_with_ttl_timeout>
+
+                    <!--
+                        Parts >= 10 MiB use wide (columnar) format.
+                        At 1M-row Kafka batches (kafka_max_block_size = 1048576),
+                        parts will typically exceed 10 MiB immediately, ensuring
+                        columnar layout for compression and column pruning.
+                        (configuration-reference.md §2)
+                    -->
+                    <min_bytes_for_wide_part>10485760</min_bytes_for_wide_part>
+                    <min_rows_for_wide_part>0</min_rows_for_wide_part>
+                </merge_tree>
+            </clickhouse>
+
+        templates:
+          podTemplate:            cache-pod
+          dataVolumeClaimTemplate: cache-data-pvc
+          serviceTemplate:        cluster-internal-service
+
+  # ─── TEMPLATES ─────────────────────────────────────────────────────────────
+  templates:
+
+    # ─── Service Templates ────────────────────────────────────────────────
+    serviceTemplates:
+
+      # Top-level CHI service — not used for direct client queries.
+      # Client-facing services are defined in 03-services.yaml.
+      - name: chi-service
+        generateName: "clickhouse-production"
+        spec:
+          type: ClusterIP
+          ports:
+            - name: http
+              port: 8123
+              targetPort: 8123
+            - name: tcp
+              port: 9000
+              targetPort: 9000
+
+      # Headless internal service per cluster.
+      # Used by the operator for pod discovery, replication, and interserver HTTP.
+      - name: cluster-internal-service
+        generateName: "clickhouse-{chi}-{cluster}"
+        spec:
+          type: ClusterIP
+          clusterIP: None
+          ports:
+            - name: http
+              port: 8123
+              targetPort: 8123
+            - name: tcp
+              port: 9000
+              targetPort: 9000
+            - name: interserver
+              port: 9009
+              targetPort: 9009
+
+    # ─── Pod Templates ────────────────────────────────────────────────────
+    podTemplates:
+
+      # ════════════════════════════════════════════════════════════════════
+      # INGEST POD TEMPLATE
+      # Stateless; no S3 backend, no NVMe cache disk.
+      # ════════════════════════════════════════════════════════════════════
+      - name: ingest-pod
+        metadata:
+          labels:
+            app.kubernetes.io/component: ingest
+          annotations:
+            # Vault Agent annotations for ingest pods are commented out.
+            # Ingest nodes do not require S3 storage credentials
+            # (they write to the cache cluster via Distributed table, not directly to S3).
+            #
+            # Enable and configure if S3Queue source bucket uses different credentials
+            # than the default, or if Kafka requires SASL secrets from Vault:
+            #
+            # vault.hashicorp.com/agent-inject: "true"
+            # vault.hashicorp.com/agent-init-first: "true"
+            # vault.hashicorp.com/role: "clickhouse-ingest"
+            # vault.hashicorp.com/agent-inject-secret-kafka: "secret/data/clickhouse/kafka/credentials"
+            # vault.hashicorp.com/agent-inject-template-kafka: |
+            #   {{- with secret "secret/data/clickhouse/kafka/credentials" -}}
+            #   <clickhouse><named_collections><kafka_connection>
+            #     <sasl_username>{{ .Data.data.username }}</sasl_username>
+            #     <sasl_password>{{ .Data.data.password }}</sasl_password>
+            #   </kafka_connection></named_collections></clickhouse>
+            #   {{- end }}
+            # vault.hashicorp.com/agent-inject-file-kafka: "kafka-credentials.xml"
+            # vault.hashicorp.com/secret-volume-path-kafka: "/etc/clickhouse-server/config.d"
+        spec:
+          serviceAccountName: clickhouse
+
+          # ─── Dedicated ingest nodes ──────────────────────────────────────
+          nodeSelector:
+            clickhouse/role: ingest
+
+          tolerations:
+            - key: clickhouse/ingest
+              operator: Exists
+              effect: NoSchedule
+
+          # ─── Anti-affinity: spread ingest shards across nodes ────────────
+          # Preferred (not required) — only 2 ingest pods; avoid hard failures
+          # if exactly 1 ingest node is available (e.g., during node drain).
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        clickhouse.altinity.com/chi:     clickhouse-production
+                        clickhouse.altinity.com/cluster: ingest
+
+          containers:
+            - name: clickhouse
+              # TBD: Adjust based on PoC load testing at ~29k rows/sec per shard.
+              # Ingest is primarily CPU-bound (Kafka deserialization + S3 reads)
+              # and memory-bound (kafka_max_block_size = 1M rows in-flight).
+              resources:
+                requests:
+                  cpu:    "4"
+                  memory: "16Gi"
+                limits:
+                  cpu:    "8"
+                  memory: "32Gi"
+
+      # ════════════════════════════════════════════════════════════════════
+      # CACHE POD TEMPLATE
+      # Persistent storage + query tier.
+      # NVMe write-through cache wrapping S3.
+      # Pod anti-affinity is REQUIRED — both replicas of a shard MUST land
+      # on different nodes for HA to hold (architecture.md §3.3, §6.1).
+      # ════════════════════════════════════════════════════════════════════
+      - name: cache-pod
+        metadata:
+          labels:
+            app.kubernetes.io/component: cache
+          annotations:
+            # ─── Vault Agent Injector annotations ────────────────────────
+            # The Vault Agent Injector webhook adds an init container that:
+            #   1. Authenticates to Vault via this pod's ServiceAccount token
+            #      (Kubernetes auth method).
+            #   2. Renders the Consul template below into s3-credentials.xml.
+            #   3. Writes the file to /etc/clickhouse-server/config.d/ before
+            #      clickhouse-server starts (agent-init-first = true).
+            #
+            # ClickHouse reads all files in config.d/ at startup. The file
+            # produced here provides <access_key_id> and <secret_access_key>
+            # for the s3_main disk defined in config.d/storage.xml above.
+            #
+            # Secret rotation: update the secret in Vault, then send SIGHUP to
+            # the clickhouse-server process to reload config without restart.
+            # See architecture.md §7.4 for the full rotation procedure.
+            #
+            # TBD: Replace Vault path and role with your environment values.
+            vault.hashicorp.com/agent-inject:           "true"
+            vault.hashicorp.com/agent-init-first:       "true"
+            vault.hashicorp.com/role:                   "clickhouse-cache"
+            vault.hashicorp.com/agent-inject-secret-s3: "secret/data/clickhouse/s3/credentials"
+            vault.hashicorp.com/agent-inject-template-s3: |
+              {{- with secret "secret/data/clickhouse/s3/credentials" -}}
+              <clickhouse>
+                  <storage_configuration>
+                      <disks>
+                          <s3_main>
+                              <access_key_id>{{ .Data.data.access_key_id }}</access_key_id>
+                              <secret_access_key>{{ .Data.data.secret_access_key }}</secret_access_key>
+                          </s3_main>
+                      </disks>
+                  </storage_configuration>
+              </clickhouse>
+              {{- end }}
+            vault.hashicorp.com/agent-inject-file-s3:        "s3-credentials.xml"
+            # Vault Agent Injector 1.3.0+: mounts the secret file at the specified
+            # path in the application container (not just /vault/secrets/).
+            vault.hashicorp.com/secret-volume-path-s3:       "/etc/clickhouse-server/config.d"
+
+        spec:
+          serviceAccountName: clickhouse
+
+          # ─── Dedicated cache nodes ────────────────────────────────────────
+          nodeSelector:
+            clickhouse/role: cache
+
+          tolerations:
+            - key: clickhouse/cache
+              operator: Exists
+              effect: NoSchedule
+
+          # ─── Anti-affinity: REQUIRED ──────────────────────────────────────
+          # Both replicas of each shard MUST be on different nodes.
+          # This rule prevents any two cache pods in this CHI from sharing a node.
+          # With 14 cache pods (7 shards × 2 replicas) this requires ≥14 cache nodes.
+          # Each cache node needs its own NVMe PV anyway, so 1-pod-per-node is
+          # the correct production topology regardless of HA.
+          #
+          # If AZ-level spreading is available, add a preferred rule here:
+          #   preferredDuringSchedulingIgnoredDuringExecution:
+          #     - weight: 50
+          #       podAffinityTerm:
+          #         topologyKey: topology.kubernetes.io/zone
+          #         labelSelector:
+          #           matchLabels:
+          #             clickhouse.altinity.com/chi: clickhouse-production
+          #             clickhouse.altinity.com/cluster: cache
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      clickhouse.altinity.com/chi:     clickhouse-production
+                      clickhouse.altinity.com/cluster: cache
+
+          containers:
+            - name: clickhouse
+              # TBD: Adjust based on PoC load testing.
+              # Cache nodes carry: sustained INSERT (~29k rows/sec), background merges,
+              # zero-copy GC coordination, NVMe cache management, and query workload.
+              resources:
+                requests:
+                  cpu:    "8"
+                  memory: "32Gi"
+                limits:
+                  cpu:    "16"
+                  memory: "64Gi"
+
+              # NVMe cache PVC mount.
+              # Path MUST match <path> in storage.xml nvme_cache disk above.
+              # This is a SEPARATE volume from the dataVolumeClaimTemplate
+              # (which covers /var/lib/clickhouse for metadata, WAL, and temp files).
+              volumeMounts:
+                - name:      nvme-cache-pvc
+                  mountPath: /var/lib/clickhouse/s3_cache
+
+    # ─── Volume Claim Templates ───────────────────────────────────────────
+    volumeClaimTemplates:
+
+      # Ingest node ClickHouse data directory.
+      # Stateless: no user data is retained; only internal ClickHouse metadata,
+      # WAL, and transient local parts before MV fires.
+      - name: ingest-data-pvc
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: standard
+          resources:
+            requests:
+              storage: 50Gi
+
+      # Cache node ClickHouse data directory.
+      # Stores: part metadata, WAL, Keeper coordination state, merge temp files.
+      # User row data lives in S3 (accessed through the nvme_cache disk).
+      # 100 Gi covers metadata for ~714M rows/shard/day with substantial headroom.
+      - name: cache-data-pvc
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: standard
+          resources:
+            requests:
+              storage: 100Gi
+
+      # Cache node NVMe write-through cache disk.
+      # Mounted at /var/lib/clickhouse/s3_cache/ (matches storage.xml <path>).
+      #
+      # TBD (Q8): Resize based on docs/configuration-reference.md §5 formula.
+      # PVC size = nvme_cache_target × 1.15 (15% filesystem headroom above max_size).
+      # ClickHouse does not pre-allocate max_size; it LRU-evicts at the soft limit.
+      # The PVC headroom prevents the filesystem from filling before eviction triggers.
+      #
+      # Current placeholder: 300 Gi (≈ max_size 256 GiB × 1.15 ≈ 295 GiB, rounded up).
+      # StorageClass MUST provision NVMe/SSD-backed PVs.
+      - name: nvme-cache-pvc
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: nvme-storageclass   # REPLACE with your NVMe StorageClass
+          resources:
+            requests:
+              storage: 300Gi                    # TBD (Q8)

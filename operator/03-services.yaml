@@ -1,0 +1,76 @@
+# Client-facing Services for the cache cluster
+#
+# Architecture reference: docs/architecture.md §4.3, §4.4
+#
+# Decision: Kubernetes Service load balancing is used (chproxy deferred).
+# The Services below target all 14 cache pods via label selector.
+# Kubernetes removes pods that fail readiness probes from the endpoint slice
+# automatically — no additional health-check configuration required.
+#
+# Two services are provided:
+#   clickhouse-cache-http  — HTTP interface (port 8123), LoadBalancer
+#   clickhouse-cache-tcp   — Native TCP interface (port 9000), ClusterIP
+#
+# Escalation path: if client concurrency causes connection exhaustion on ClickHouse
+# pods, or per-user query routing becomes a requirement, add chproxy in front of
+# these services. See architecture.md §4.4 for the chproxy trade-off analysis.
+#
+# TLS: not terminated here. Configure a Kubernetes Ingress or external LB in front
+# of clickhouse-cache-http if TLS is required.
+#
+# Label selectors use Altinity operator labels — validate against your operator
+# version if the label keys differ.
+
+---
+# HTTP interface — for BI tools, client libraries using HTTP protocol,
+# and ClickHouse client with --host flag.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-cache-http
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of:  clickhouse-production
+    app.kubernetes.io/component: cache
+  annotations:
+    # Uncomment to restrict the LoadBalancer to internal network:
+    # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    # cloud.google.com/load-balancer-type: "Internal"
+spec:
+  type: LoadBalancer       # Change to ClusterIP for internal-only access
+  selector:
+    clickhouse.altinity.com/chi:     clickhouse-production
+    clickhouse.altinity.com/cluster: cache
+  ports:
+    - name:       http
+      port:       8123
+      targetPort: 8123
+      protocol:   TCP
+  # sessionAffinity: ClientIP  # Uncomment to pin a client to the same cache pod
+  # sessionAffinityConfig:     # (may help with connection reuse in long-running sessions)
+  #   clientIP:
+  #     timeoutSeconds: 10800
+
+---
+# Native TCP interface — for ClickHouse native client and drivers
+# (Go driver, Python clickhouse-driver, etc.)
+# ClusterIP: in-cluster access only. Use a LoadBalancer if external TCP access is needed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-cache-tcp
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of:   clickhouse-production
+    app.kubernetes.io/component: cache
+spec:
+  type: ClusterIP
+  selector:
+    clickhouse.altinity.com/chi:     clickhouse-production
+    clickhouse.altinity.com/cluster: cache
+  ports:
+    - name:       tcp
+      port:       9000
+      targetPort: 9000
+      protocol:   TCP

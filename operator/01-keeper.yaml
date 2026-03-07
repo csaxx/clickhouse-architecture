@@ -1,0 +1,130 @@
+# ClickHouseKeeperInstallation — 5-node production Keeper ensemble
+#
+# Altinity operator 0.26.0+
+# CRD: clickhouse-keeper.altinity.com/v1alpha1
+#
+# Architecture reference: docs/architecture.md §3.1, §6.2, §8.5
+#
+# Open Decision #3: CHKI CRD is used here. If you must use a standalone StatefulSet
+# instead (e.g., operator version does not support CHKI), replace this manifest with
+# a StatefulSet + headless Service using the clickhouse-keeper binary.
+#
+# Open Decision #4: 5 nodes chosen (tolerates 2 simultaneous failures).
+# Reduce replicasCount to 3 for environments where 5 dedicated nodes are unavailable
+# (tolerates 1 failure only).
+#
+# REQUIRED node setup before applying:
+#   kubectl label node <node-1..5> clickhouse/role=keeper
+#   kubectl taint node <node-1..5> clickhouse/keeper=true:NoSchedule
+#
+# StorageClass: replace "standard" with a fast SSD StorageClass available in your cluster.
+# Keeper log and snapshot I/O is latency-sensitive; avoid spinning disk.
+#
+# Pod anti-affinity below enforces one Keeper pod per node.
+# Do NOT co-locate Keeper pods with ClickHouse server pods — Keeper is the
+# highest-criticality component; CPU/memory contention can cause quorum instability
+# (architecture.md §8.5).
+
+apiVersion: clickhouse-keeper.altinity.com/v1alpha1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: clickhouse-keeper
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of: clickhouse-production
+    app.kubernetes.io/component: keeper
+spec:
+  configuration:
+    settings:
+      tcp_port: "2181"
+
+      # Raft log and snapshot paths — must be on a persistent volume.
+      # These paths are inside the container and are covered by the PVC below.
+      log_storage_path: "/var/lib/clickhouse-keeper/coordination/log"
+      snapshot_storage_path: "/var/lib/clickhouse-keeper/coordination/snapshots"
+
+      coordination_settings:
+        # Raft operation and session timeouts (milliseconds).
+        operation_timeout_ms: "10000"
+        session_timeout_ms:   "30000"
+
+        # Log level for the Raft subsystem.
+        # Use "warning" in production; "information" for quorum debugging.
+        raft_logs_level: "warning"
+
+        # fsync on every Raft log append.
+        # MUST be true in production — disabling risks data loss on node crash.
+        force_sync: "true"
+
+        # Heartbeat and election timeouts (milliseconds).
+        heart_beat_interval_ms:          "500"
+        election_timeout_lower_bound_ms: "1000"
+        election_timeout_upper_bound_ms: "2000"
+
+        # Number of log entries to retain after a snapshot.
+        reserved_log_items: "100000"
+
+        # Snapshot threshold: take a snapshot every N log entries.
+        snapshot_distance: "100000"
+
+    clusters:
+      - name: default
+        layout:
+          replicasCount: 5   # tolerates 2 simultaneous node failures
+
+  templates:
+    podTemplates:
+      - name: default
+        metadata:
+          labels:
+            app.kubernetes.io/component: keeper
+        spec:
+          # ─── Dedicated Keeper nodes ────────────────────────────────────────
+          nodeSelector:
+            clickhouse/role: keeper
+
+          tolerations:
+            - key: clickhouse/keeper
+              operator: Exists
+              effect: NoSchedule
+
+          # ─── Anti-affinity: exactly one Keeper pod per node ────────────────
+          # requiredDuringScheduling: HA is not guaranteed if two Keeper pods
+          # land on the same node and that node fails.
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/component: keeper
+
+          # ─── Resource requests and limits ──────────────────────────────────
+          # TBD: Adjust based on actual Raft log throughput during PoC.
+          # At the write rates in this architecture (~57k rows/sec through zero-copy GC
+          # + S3Queue + replication coordination), 4 vCPU / 8 GiB is a conservative start.
+          containers:
+            - name: clickhouse-keeper
+              resources:
+                requests:
+                  cpu:    "2"
+                  memory: "4Gi"
+                limits:
+                  cpu:    "4"
+                  memory: "8Gi"
+
+    volumeClaimTemplates:
+      - name: default
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          # TBD: Replace with a fast SSD StorageClass in your cluster.
+          # Keeper Raft log I/O is synchronous (force_sync = true); latency matters.
+          storageClassName: standard
+          resources:
+            requests:
+              # Sized for Raft log + snapshots at the design ingest rate.
+              # 20 Gi provides several days of log headroom before rotation;
+              # snapshots are typically a few hundred MB. Increase if log retention
+              # settings are raised above defaults.
+              storage: 20Gi

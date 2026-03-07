@@ -1,0 +1,253 @@
+# NetworkPolicy rules for the ClickHouse production deployment
+#
+# Architecture reference: docs/architecture.md §7.3
+#
+# These policies assume a default-deny posture (no NetworkPolicy = allow all in
+# most CNI implementations). Apply a cluster-wide or namespace-scoped default-deny
+# policy BEFORE applying these allow rules.
+#
+# Policies defined here:
+#   1. clickhouse-intercluster    — ingest ↔ cache inter-pod communication (9000, 9009)
+#   2. clickhouse-to-keeper       — all CH pods → Keeper (2181, 2888, 3888)
+#   3. keeper-internal            — Keeper peer-to-peer Raft (2888, 3888)
+#   4. external-to-cache          — external clients → cache pods (8123, 9000)
+#   5. clickhouse-to-vault        — all CH pods → Vault Agent sidecar egress (8200)
+#   6. clickhouse-to-s3           — all CH pods → S3 backend egress (443 / 9000)
+#
+# TBD (Q1): Update clickhouse-to-s3 egress with the actual S3 endpoint IP range
+# or replace ipBlock with a podSelector if MinIO runs in-cluster.
+
+---
+# ─── 1. ClickHouse inter-cluster communication ────────────────────────────────
+# Covers ingest → cache (Distributed INSERT on port 9000) and cache → cache
+# (zero-copy replication interserver HTTP on port 9009).
+# The Altinity operator sets interserver_secret automatically for pods in the same
+# CHI; cross-cluster INSERTs are authenticated without manual credential management.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-intercluster
+  namespace: clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse.altinity.com/chi: clickhouse-production
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              clickhouse.altinity.com/chi: clickhouse-production
+      ports:
+        - protocol: TCP
+          port: 9000    # Native TCP — Distributed INSERT and queries
+        - protocol: TCP
+          port: 9009    # Interserver HTTP — replication part exchange
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              clickhouse.altinity.com/chi: clickhouse-production
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9009
+
+---
+# ─── 2. ClickHouse pods → Keeper ─────────────────────────────────────────────
+# All CH pods (ingest + cache) must reach Keeper for:
+#   - ReplicatedMergeTree coordination (cache pods)
+#   - S3Queue file claim locks (ingest pods)
+#   - Zero-copy GC (cache pods)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-to-keeper
+  namespace: clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse.altinity.com/chi: clickhouse-production
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keeper
+      ports:
+        - protocol: TCP
+          port: 2181    # Keeper client port
+
+---
+# ─── 3. Keeper internal Raft communication ────────────────────────────────────
+# Keeper peers communicate on ports 2888 (leader→follower) and 3888 (election).
+# Also allows CH client connections (port 2181) from CH pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keeper-internal
+  namespace: clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: keeper
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # CH pods → Keeper client port
+    - from:
+        - podSelector:
+            matchLabels:
+              clickhouse.altinity.com/chi: clickhouse-production
+      ports:
+        - protocol: TCP
+          port: 2181
+    # Keeper peer-to-peer Raft
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keeper
+      ports:
+        - protocol: TCP
+          port: 2888    # Leader → followers (log replication)
+        - protocol: TCP
+          port: 3888    # Election port
+  egress:
+    # Keeper peer-to-peer Raft
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: keeper
+      ports:
+        - protocol: TCP
+          port: 2888
+        - protocol: TCP
+          port: 3888
+
+---
+# ─── 4. External clients → cache cluster ─────────────────────────────────────
+# Allows traffic from any source (external to the namespace) to reach cache pods
+# on the query-serving ports.
+# The clickhouse-cache-http and clickhouse-cache-tcp Services in 03-services.yaml
+# direct traffic here via the label selector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: external-to-cache
+  namespace: clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse.altinity.com/chi:     clickhouse-production
+      clickhouse.altinity.com/cluster: cache
+  policyTypes:
+    - Ingress
+  ingress:
+    # HTTP interface — BI tools, HTTP-protocol client libraries
+    - ports:
+        - protocol: TCP
+          port: 8123
+    # Native TCP — clickhouse-client, Go/Python drivers
+    - ports:
+        - protocol: TCP
+          port: 9000
+
+---
+# ─── 5. ClickHouse pods → Vault ──────────────────────────────────────────────
+# The Vault Agent init container authenticates to Vault on port 8200 (HTTPS API).
+# Adjust namespaceSelector.matchLabels if Vault runs in a different namespace.
+# If Vault runs outside the cluster, replace podSelector/namespaceSelector with
+# an ipBlock pointing to the Vault server IP.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-to-vault
+  namespace: clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse.altinity.com/chi: clickhouse-production
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault   # adjust to your Vault namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vault
+      ports:
+        - protocol: TCP
+          port: 8200    # Vault HTTPS API
+
+---
+# ─── 6. ClickHouse pods → S3 backend ─────────────────────────────────────────
+# Cache pods need S3 egress for write-through INSERTs and read-through cache misses.
+# Ingest pods need S3 egress for S3Queue source bucket reads.
+#
+# TBD (Q1): Choose ONE of the options below based on your S3 backend selection:
+#
+# Option A — MinIO in-cluster:
+#   Replace ipBlock with a podSelector targeting MinIO pods and a namespaceSelector
+#   if MinIO is in a different namespace. Use port 9000 (MinIO default) or 443.
+#
+# Option B — MinIO or NetApp external to cluster:
+#   Replace 0.0.0.0/0 with the specific CIDR block of your S3 endpoint.
+#   Use port 443 for HTTPS, or the port configured on your S3 service.
+#
+# Current placeholder: 0.0.0.0/0 allows all egress on 443/9000.
+# RESTRICT before production — overly permissive egress is a security risk.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-to-s3
+  namespace: clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse.altinity.com/chi: clickhouse-production
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0      # TBD (Q1): restrict to S3 endpoint CIDR
+      ports:
+        - protocol: TCP
+          port: 443              # HTTPS (standard S3-compatible)
+        - protocol: TCP
+          port: 9000             # MinIO default port if not on 443
+
+---
+# ─── DNS egress (required for all pods) ──────────────────────────────────────
+# Without this rule, under a default-deny posture, pods cannot resolve DNS
+# (e.g., Keeper FQDN, S3 endpoint hostname, Vault hostname).
+# kube-dns runs in kube-system on UDP/TCP 53.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: clickhouse
+spec:
+  podSelector: {}   # applies to all pods in namespace
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
