@@ -48,7 +48,16 @@
 9. [Open Decisions](#9-open-decisions)
 10. [Recommended Versions](#10-recommended-versions)
 11. [Implementation Roadmap](#11-implementation-roadmap)
-12. [Configuration Reference](#12-configuration-reference)
+12. [Scalability Considerations](#12-scalability-considerations)
+    - 12.1 [Ingest Tier](#121-ingest-tier)
+    - 12.2 [Cache Cluster](#122-cache-cluster)
+    - 12.3 [ClickHouse Keeper](#123-clickhouse-keeper)
+    - 12.4 [S3 Storage](#124-s3-storage)
+    - 12.5 [Query Concurrency](#125-query-concurrency)
+    - 12.6 [Compliance Delete Scalability](#126-compliance-delete-scalability)
+    - 12.7 [Operational Scalability](#127-operational-scalability)
+    - 12.8 [Scalability Summary](#128-scalability-summary)
+13. [Configuration Reference](#13-configuration-reference)
 
 ---
 
@@ -843,7 +852,129 @@ Expose `cache_distributed` to clients via the chosen routing mechanism (K8s Serv
 
 ---
 
-## 12. Configuration Reference
+## 12. Scalability Considerations
+
+This section evaluates the scalability characteristics of each architectural tier against the confirmed workload: ~5B rows/day at ~57,870 rows/sec sustained, 10–20% duplicate rate, 7-shard × 2-replica cache cluster, and 2-shard ingest tier.
+
+### 12.1 Ingest Tier
+
+**Rating: Moderate**
+
+The 2-shard ingest tier is stateless and handles ~28,935 rows/sec per shard comfortably at current load. Scaling to 4 shards requires Kafka topic repartitioning — partition count must remain a multiple of the ingest shard count. This is a coordinated, non-zero-downtime operation: consumer offset assignments are disrupted during repartitioning.
+
+S3Queue scales more smoothly than Kafka: Keeper coordinates file claims per-file, so additional ingest nodes participate in claim coordination without Kafka partition topology constraints.
+
+**Scale-out path**: 2-shard → 4-shard is the logical next step. Plan Kafka repartitioning in advance; validate zero-data-loss handoff in staging before production.
+
+### 12.2 Cache Cluster
+
+**Rating: Strong (vertical) / High Risk (horizontal)**
+
+**Vertical scaling** is the low-risk path: larger NVMe PVCs, more CPU, more RAM per pod. S3 absorbs data growth without pod-level disk pressure. Adding replicas per shard is zero-copy — no data is transferred between CH pods; only Keeper coordination is required.
+
+**Horizontal scaling (resharding) is the critical constraint.** ClickHouse has no automated resharding. Adding an 8th cache shard requires:
+
+1. Deploying the new shard in the CHI.
+2. Migrating data from existing shards via `INSERT INTO new_shard SELECT ... FROM old_shard` — a multi-hour, multi-TB S3 read/write operation.
+3. Rewriting the Distributed table DDL with the updated topology.
+4. Running this concurrently with live ingest at ~57,870 rows/sec.
+
+The 7-shard count must be validated against a capacity projection. At 200 B/row average, 5B rows/day ≈ 1 TB/day raw; per-shard ≈ 143 GB/day. At 90-day retention, each shard holds ~12.9 TB of raw data before compression. NVMe PVC sizing must be derived from these numbers using the sizing formula in [Section 13](#13-configuration-reference).
+
+> **Recommendation**: Establish a resharding runbook before go-live. The absence of a tested procedure when capacity is reached is a higher risk than the resharding operation itself.
+
+### 12.3 ClickHouse Keeper
+
+**Rating: Moderate**
+
+Keeper uses Raft consensus — adding nodes improves fault tolerance but **does not increase write throughput**. Write capacity is fixed by the Raft leader. At 7 shards × 2 replicas, Keeper receives part registration writes from 14 replica paths. With `kafka_max_block_size = 1M` at ~57,870 rows/sec, approximately 1–2 new parts are registered per shard per second. Merge completions and zero-copy GC events add further writes on top.
+
+This is manageable at current scale, but Keeper write pressure must be profiled in PoC Phase 2 before scaling the shard count further.
+
+A deeper structural concern: a single Keeper ensemble serves replication metadata, S3Queue file coordination, and zero-copy GC simultaneously. Each additional subsystem relying on Keeper **increases the blast radius of a quorum loss**. Separate Keeper ensembles per subsystem would limit blast radius, but this is not supported by the current single-CHI design and should be treated as a future architectural option if Keeper becomes a bottleneck.
+
+### 12.4 S3 Storage
+
+**Rating: Strong**
+
+S3 scales horizontally and independently of ClickHouse. Per-shard prefix isolation bounds partition-level operations (TTL drops, `OPTIMIZE PARTITION FINAL`) to a single shard's data. MinIO distributed erasure-coded mode scales by adding drive nodes; NetApp scales per hardware configuration.
+
+**Write amplification** compounds with scale and must be budgeted. Sources:
+- Write-through: every INSERT writes to S3 immediately at ~57,870 rows/sec.
+- Deduplication merges: 500M–1B duplicate rows/day are rewritten during background merges.
+- Compliance `OPTIMIZE TABLE PARTITION FINAL` (see [Section 12.6](#126-compliance-delete-scalability)) adds further S3 rewrites.
+
+Row size (Open Decision #8) is the blocking input for quantifying this amplification. Resolve it before S3 bandwidth and cost budgeting.
+
+**Zero-copy GC lag**: pre-merge S3 parts are not deleted until all replicas acknowledge the merged result in Keeper. Extended replica downtime causes unbounded S3 object accumulation. Monitor S3 object count per shard prefix and enforce a replica downtime SLA.
+
+### 12.5 Query Concurrency
+
+**Rating: Moderate**
+
+Parallel fan-out to 7 shards scales query execution throughput linearly with shard count. With 14 cache pods as potential coordinators, the loss of any single pod has negligible routing impact.
+
+Two concurrency risks exist at higher client load:
+
+**Connection exhaustion**: K8s Service LB has no connection pooling. Each client connection maps directly to a ClickHouse thread plus memory allocation. At high client concurrency (>50 simultaneous connections is a practical threshold to watch), connection overhead accumulates on cache pods. chproxy, which pools connections before forwarding to CH, is the recommended mitigation — see [Section 4.4](#44-query-routing-k8s-service-vs-chproxy).
+
+**Merge/query thread contention**: cache nodes carry concurrent background load — write-through INSERTs at ~57,870 rows/sec and deduplication merges on 500M–1B rows/day. ClickHouse separates background merge threads (`background_pool_size`) from query threads, but they share the same CPU and memory envelope. Under high concurrent analytical query load, contention for RAM is the likely bottleneck. PoC Phase 2 must measure this before scaling to production concurrency levels — see [Section 4.5](#45-dedicated-query-cluster-evaluated-deferred).
+
+**Scale-out path**: (1) Add chproxy when client concurrency approaches connection exhaustion. (2) Add a dedicated query cluster (Section 4.5) when PoC demonstrates measurable merge/query contention. (3) Add cache replicas (zero-copy) to distribute read load.
+
+### 12.6 Compliance Delete Scalability
+
+**Rating: Critical**
+
+User-ID compliance deletes (`DELETE FROM ... WHERE user_id = X`) are the most significant scalability constraint in the architecture. This is a non-partition-aligned row-level operation, making physical deletion inherently expensive at scale.
+
+**Scale of the problem at production volumes**:
+
+A single user's data across 12 months of daily partitions requires:
+- 365 partitions × 7 shards = **2,555 `OPTIMIZE TABLE PARTITION FINAL` calls**
+- Each call reads and rewrites the full partition on S3 (~143 GB/day/shard at projected volumes)
+- Total S3 I/O per user delete: potentially tens of terabytes read + written
+
+Running nightly compliance sweeps for multiple users simultaneously compounds this further. These operations compete directly with live ingest merge threads at ~57,870 rows/sec.
+
+**The 24-hour physical deletion SLA for user-ID row-level deletes may be infeasible at production volumes.** This is Open Decision #17 — see [Section 9](#9-open-decisions). The PoC Phase 2 compliance load test (see [Section 11](#11-implementation-roadmap)) must measure elapsed time for `OPTIMIZE TABLE PARTITION FINAL` at production partition sizes; that measurement is the primary input for the legal/compliance determination.
+
+**Available mitigations** (in order of preference):
+
+| Mitigation | Effect | Cost |
+|---|---|---|
+| Accept logical inaccessibility (deletion bitmap) as SLA compliance | Eliminates `OPTIMIZE TABLE FINAL` requirement entirely | Requires legal/compliance approval — Open Decision #17 |
+| Rate-limit OPTIMIZE calls to off-peak windows | Reduces ingest contention | Requires deletion queue management; does not reduce total S3 I/O |
+| Partition by `(event_date, user_id_bucket)` | Reduces rows-per-partition | Dramatically increases partition count; complicates TTL and query routing |
+
+If the compliance team requires physical S3 byte removal within 24 hours, the mitigation design must be addressed before production go-live.
+
+### 12.7 Operational Scalability
+
+**Rating: Moderate**
+
+The single CHI containing both the ingest and cache clusters simplifies operator configuration but creates a wide blast radius for CHI-level operations. A CHI update triggers a rolling restart across all 19–21 pods. Separate CHIs for ingest and cache would allow independent upgrade cycles at the cost of manual `remote_servers` management.
+
+Secret rotation (see [Section 7.4](#74-credential-management-via-hashicorp-vault)) requires sending `SIGHUP` to each ClickHouse pod after Vault Agent re-renders the credential file. At 19–21 pods, this is manageable manually. If pod count grows significantly, a rotation automation script or operator hook becomes necessary.
+
+Monitoring scales linearly with pod count: each of the 21 pods emits independent `system.merges`, `system.filesystem_cache`, and `system.text_log` streams. Aggregate dashboards (merge queue depth, cache hit rate, part count per shard) are required before production — per-pod inspection does not scale.
+
+### 12.8 Scalability Summary
+
+| Dimension | Rating | Primary Bottleneck | Scale-out Path |
+|---|---|---|---|
+| Ingest tier | Moderate | Kafka repartitioning to add shards | Add shards (2→4); repartition Kafka |
+| Cache cluster — vertical | Strong | NVMe sizing requires row size input (Decision #8) | Larger PVCs; S3 absorbs growth |
+| Cache cluster — horizontal | High risk | No automated resharding; multi-hour manual migration | Establish resharding runbook before capacity ceiling |
+| ClickHouse Keeper | Moderate | Raft write ceiling; multi-subsystem blast radius | Profile Keeper write pressure at 7 shards in PoC |
+| S3 storage | Strong | Write amplification cost (row size TBD) | S3 scales independently |
+| Query concurrency | Moderate | No connection pooling; merge/query RAM contention | chproxy; dedicated query cluster (Section 4.5) |
+| Compliance deletes | Critical | 2,555 OPTIMIZE calls per user at production volume | Resolve Open Decision #17; prefer logical inaccessibility |
+| Operational | Moderate | Single CHI blast radius; manual SIGHUP rotation | Automate rotation; split CHI if pod count grows |
+
+---
+
+## 13. Configuration Reference
 
 Annotated DDL templates and server configuration baselines for all table types are in the companion document:
 
