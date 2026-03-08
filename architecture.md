@@ -699,21 +699,55 @@ OPTIMIZE TABLE cache_table PARTITION '2024-01-02' FINAL;
 
 `OPTIMIZE TABLE PARTITION FINAL` rewrites all data parts in a partition into a single merged part, physically removing the deleted rows from S3 in the process.
 
-**Severity at 5B rows/day scale**: This is a critical risk that must be explicitly planned for.
+**Severity at 5B rows/day scale**: This is a high-risk operation requiring explicit planning. Risk level is conditional on nightly batch volume (see below).
 
 - At ~714M rows/shard/day, each daily partition on each shard holds hundreds of millions of rows. `OPTIMIZE TABLE PARTITION FINAL` reads all S3 parts for that partition, rewrites them into one merged part, and writes the result back — a multi-GB+ S3 I/O operation per partition.
-- A single user's data across 12 months with daily partitions = 365 `OPTIMIZE TABLE FINAL` calls per shard = **2,555 total** across the cluster. At production data volumes, this sweep could take many hours and compete directly with normal ingest merge activity.
+- In practice, a user's activity is typically weighted toward recent partitions. A realistic assumption is **~30 affected partitions per user delete** (compared to the theoretical maximum of 365 for a full year of retention). At 30 partitions × 7 shards = **210 `OPTIMIZE TABLE PARTITION FINAL` calls per user** — a 92% reduction from the worst-case 2,555. The 365-partition / 2,555-call figure remains valid as the theoretical maximum (full 12-month retention with data in every daily partition) but is not the expected operational case.
 - Zero-copy compatibility: `OPTIMIZE TABLE FINAL` creates new merged parts on S3; Keeper coordinates GC of old parts. Allow additional time (typically minutes) for GC to physically remove S3 objects. This lag counts against the 24-hour SLA.
 
-**The 24-hour physical deletion SLA for user-ID row-level deletes may be infeasible at production volumes.** See [Open Decision #11](#9-open-decisions) for the legal determination required before finalizing this path.
+**Recency bias analysis — benefits and complications**:
 
-**Hard architectural note**: `PARTITION BY toYYYYMMDD(event_date)` (daily) is the primary mitigation lever: each `OPTIMIZE TABLE PARTITION FINAL` call operates on a single day's data per shard, limiting the rows per partition that must be rewritten. The PoC must measure actual elapsed time and S3 I/O per partition to determine whether the 24-hour SLA is achievable (primary input for [Open Decision #11](#9-open-decisions)).
+*Benefits*:
+1. **NVMe cache warmth for reads**: write-through (`cache_on_write_operations = 1`) guarantees recent partitions are always NVMe-resident. The read phase of `OPTIMIZE TABLE FINAL` on recent partitions reads from local NVMe (~1–3 GB/s) rather than S3 (~100–500 MB/s) — 3–30× faster reads.
+2. **Old partitions are already heavily merged**: background merges have had more time to consolidate older partitions, resulting in fewer parts per partition and less merge work per `OPTIMIZE FINAL` call on older partitions.
+
+*Complications*:
+1. **Recent partitions have more un-merged small parts**: KafkaEngine fires at `kafka_max_block_size = 1M` rows. At ~29k rows/sec per ingest shard, a 1M-row batch arrives every ~35 sec. Recent partitions accumulate many small parts before background merges consolidate them — `OPTIMIZE FINAL` on a recent partition involves more individual merge steps and more S3 PUT operations.
+2. **NVMe cache eviction pressure**: `OPTIMIZE FINAL` on warm recent partitions writes the large new merged part back through the NVMe cache (write-through). The merged part can occupy significant NVMe space, potentially evicting other recently-cached parts under LRU pressure and causing temporary cache miss spikes for concurrent queries.
+3. **S3 writes are always on the critical path**: NVMe warmth accelerates only the read phase. The output write is always write-through (NVMe + S3), and S3 write throughput remains the bottleneck regardless of cache state.
+
+**Per-shard wall-clock estimate** (30 partitions per shard, executed sequentially):
+
+| Partition state | Read source | Estimated per call | 30-call total |
+|---|---|---|---|
+| NVMe-warm (recent, ~20/30 partitions) | Local NVMe at 1–3 GB/s | 1–6 min | — |
+| Cold (older, ~10/30 partitions) | S3 at 100–500 MB/s | 2–10 min | — |
+| **Combined per-shard total** | | | **~30 min – 8 hours** |
+
+All 7 shards execute in parallel → wall-clock equals per-shard time (assuming adequate `background_pool_size`).
+
+**Multi-user nightly batch — the binding risk variable**:
+
+`OPTIMIZE TABLE PARTITION FINAL` calls for different users operating on the same partition must be serialized (same `background_pool_size`; same partition is rewritten). Per-user wall-clock does not parallelize across users sharing the same partitions.
+
+| Users per nightly batch | Estimated wall-clock (midrange, per shard) | 24-hour SLA |
+|---|---|---|
+| 1 | ~2–3 hours | Comfortably feasible |
+| 3–5 | ~6–15 hours | Feasible with scheduling |
+| 10 | ~20–30 hours | Borderline / infeasible |
+| 20+ | >24 hours | Infeasible without optimization |
+
+**Feasibility assessment**: The 24-hour SLA is feasible for small nightly batches (1–5 users). It becomes infeasible if the nightly batch consistently exceeds ~10 users without scheduling or optimization. The **number of users per nightly batch** is the primary new risk variable and must be quantified before this path can be fully validated. See [Open Decision #11](#9-open-decisions).
+
+**Hard architectural note**: `PARTITION BY toYYYYMMDD(event_date)` (daily) is the primary mitigation lever: each `OPTIMIZE TABLE PARTITION FINAL` call operates on a single day's data per shard, limiting the rows per partition that must be rewritten. The PoC must measure actual elapsed time and S3 I/O per partition — and must test representative multi-user batch runs — to determine whether the 24-hour SLA is achievable (primary input for [Open Decision #11](#9-open-decisions)).
 
 #### PoC Validation Requirements
 
 1. Execute a representative nightly DELETE on a partition sized to production data volumes.
 2. Measure the time from DELETE issuance to physical S3 object removal (OPTIMIZE TABLE FINAL + GC).
-3. Confirm the 24-hour SLA is achievable under production load conditions.
+3. Test with 30 representative partitions (weighted toward recent, ~20 warm / ~10 cold); measure per-user wall-clock.
+4. Also run 3-user and 10-user batch scenarios to characterize multi-user serialization scaling.
+5. Confirm the 24-hour SLA is achievable under production load conditions.
 
 ### 8.4 KafkaEngine At-Least-Once Delivery
 
@@ -784,7 +818,7 @@ The following decisions must be resolved before YAML authoring begins. Each bloc
 
 | # | Decision | Blocks |
 |---|---|---|
-| 11 | **User-ID compliance SLA — physical vs logical deletion**: for `DELETE WHERE user_id = X`, does the 24-hour SLA require **physical S3 byte removal** or is **logical inaccessibility** (deletion bitmap applied; rows invisible to all queries) sufficient? Physical removal at 5B rows/day scale requires `OPTIMIZE TABLE FINAL` across all affected partitions — potentially infeasible within 24 hours (see [Section 8.3](#83-compliance-mutations-with-zero-copy-replication)). **This is a legal/compliance determination. The compliance team must provide a formal written answer before DDL is finalized.** | Cache cluster DDL, `PARTITION BY` design, compliance SLA validation |
+| 11 | **User-ID compliance SLA — physical vs logical deletion**: for `DELETE WHERE user_id = X`, does the 24-hour SLA require **physical S3 byte removal** or is **logical inaccessibility** (deletion bitmap applied; rows invisible to all queries) sufficient? Under the revised ~30-partition-per-user assumption, physical removal requires **210 `OPTIMIZE TABLE FINAL` calls per user** (down from the 365-partition worst-case of 2,555). The 24-hour SLA is **feasible for small nightly batches (1–5 users)** but becomes infeasible if the batch consistently exceeds ~10 users (see [Section 8.3](#83-compliance-mutations-with-zero-copy-replication)). **Two required inputs**: (1) physical vs logical SLA — legal/compliance determination required; (2) typical number of users per nightly deletion batch — product/ops team must provide. **Both answers are required before DDL is finalized.** | Cache cluster DDL, `PARTITION BY` design, compliance SLA validation |
 
 ---
 
@@ -825,7 +859,7 @@ Deploy a single cache shard with zero-copy replication enabled. Validate:
 
 **Mutation and compliance validation**:
 - **TTL path**: create a table with `TTL eviction_date DELETE SETTINGS TTL_only_drop_parts = 1`; populate with data where all rows in a part have expired TTL; confirm the part is dropped within the TTL check interval (≤60 sec) and S3 objects are physically removed; verify no rewrite merge is triggered
-- **Compliance delete load test**: execute lightweight DELETE (`DELETE FROM t WHERE user_id = X`) on a partition sized to representative production volumes; run `OPTIMIZE TABLE PARTITION FINAL`; measure elapsed time and S3 I/O; measure time from DELETE issuance to confirmed physical S3 part removal; document against the 24-hour SLA — this is the primary input for resolving [Open Decision #11](#9-open-decisions)
+- **Compliance delete load test**: execute lightweight DELETE (`DELETE FROM t WHERE user_id = X`) on 30 representative partitions (weighted toward recent, ~20 warm / ~10 cold); run `OPTIMIZE TABLE PARTITION FINAL` sequentially per shard; measure per-user elapsed time and S3 I/O; also run 3-user and 10-user batch scenarios to characterize multi-user serialization; measure time from DELETE issuance to confirmed physical S3 part removal; document all results against the 24-hour SLA — this is the primary input for resolving [Open Decision #11](#9-open-decisions)
 - **Patch parts validation** (if nightly compliance updates required): validate `ALTER TABLE t UPDATE` using patch parts with zero-copy enabled; confirm both replicas reflect the update correctly
 - Document all measured timings for inclusion in the compliance evidence package
 
@@ -924,30 +958,54 @@ Two concurrency risks exist at higher client load:
 
 ### 12.6 Compliance Delete Scalability
 
-**Rating: Critical**
+**Rating: High** (conditional — Critical if nightly batch exceeds ~10 users; see below)
 
 User-ID compliance deletes (`DELETE FROM ... WHERE user_id = X`) are the most significant scalability constraint in the architecture. This is a non-partition-aligned row-level operation, making physical deletion inherently expensive at scale.
 
-**Scale of the problem at production volumes**:
+**Scale of the problem — revised under recency assumption**:
 
-A single user's data across 12 months of daily partitions requires:
-- 365 partitions × 7 shards = **2,555 `OPTIMIZE TABLE PARTITION FINAL` calls**
-- Each call reads and rewrites the full partition on S3 (~143 GB/day/shard at projected volumes)
-- Total S3 I/O per user delete: potentially tens of terabytes read + written
+A user's activity is typically weighted toward recent partitions. The realistic per-user case assumes ~30 affected daily partitions, not 365 for a full year. The 365-partition figure remains the theoretical maximum for a user with data in every daily partition across 12 months.
 
-Running nightly compliance sweeps for multiple users simultaneously compounds this further. These operations compete directly with live ingest merge threads at ~57,870 rows/sec.
+| Scenario | Partitions | OPTIMIZE calls (× 7 shards) | Uncompressed S3 I/O (read + write) | Compressed (~5× LZ4/ZSTD) |
+|---|---|---|---|---|
+| Typical (30 partitions) | 30 | **210** | ~60 TB | ~12 TB |
+| Worst case (365 partitions, full year) | 365 | **2,555** | ~730 TB | ~146 TB |
 
-**The 24-hour physical deletion SLA for user-ID row-level deletes may be infeasible at production volumes.** This is Open Decision #17 — see [Section 9](#9-open-decisions). The PoC Phase 2 compliance load test (see [Section 11](#11-implementation-roadmap)) must measure elapsed time for `OPTIMIZE TABLE PARTITION FINAL` at production partition sizes; that measurement is the primary input for the legal/compliance determination.
+**Recency bias — warm/cold timing breakdown**:
+
+Per-call time varies by partition warmth. At 30 partitions per shard (~20 NVMe-warm recent, ~10 cold):
+
+| Partition state | Read source | Estimated per call |
+|---|---|---|
+| NVMe-warm (~20/30) | Local NVMe at 1–3 GB/s | 1–6 min |
+| Cold (~10/30) | S3 at 100–500 MB/s | 2–10 min |
+
+30 sequential calls per shard → **~30 min (optimistic) to ~8 hours (pessimistic)**. All 7 shards run in parallel; wall-clock equals per-shard time. See [Section 8.3](#83-compliance-mutations-with-zero-copy-replication) for the full recency bias analysis (including NVMe eviction pressure and small-part accumulation on recent partitions).
+
+**Multi-user nightly batch — the binding risk variable**:
+
+`OPTIMIZE TABLE PARTITION FINAL` calls for different users on the same partition are serialized. Per-user wall-clock does not parallelize across users sharing the same partitions.
+
+| Users per nightly batch | Estimated wall-clock (midrange, per shard) | 24-hour SLA |
+|---|---|---|
+| 1 | ~2–3 hours | Comfortably feasible |
+| 3–5 | ~6–15 hours | Feasible with scheduling |
+| 10 | ~20–30 hours | Borderline / infeasible |
+| 20+ | >24 hours | Infeasible without optimization |
+
+The **number of users per nightly batch** is the primary new risk variable and must be quantified — see [Open Decision #11](#9-open-decisions).
 
 **Available mitigations** (in order of preference):
 
 | Mitigation | Effect | Cost |
 |---|---|---|
-| Accept logical inaccessibility (deletion bitmap) as SLA compliance | Eliminates `OPTIMIZE TABLE FINAL` requirement entirely | Requires legal/compliance approval — Open Decision #17 |
+| Accept logical inaccessibility (deletion bitmap) as SLA compliance | Eliminates `OPTIMIZE TABLE FINAL` requirement entirely | Requires legal/compliance approval — Open Decision #11 |
+| Quantify and cap users per nightly batch | Keeps wall-clock within 24h | Requires product/ops constraint; queue management |
+| Schedule to minimize concurrent user overlap on same partitions | Reduces serialization | Requires deletion job ordering logic |
 | Rate-limit OPTIMIZE calls to off-peak windows | Reduces ingest contention | Requires deletion queue management; does not reduce total S3 I/O |
 | Partition by `(event_date, user_id_bucket)` | Reduces rows-per-partition | Dramatically increases partition count; complicates TTL and query routing |
 
-If the compliance team requires physical S3 byte removal within 24 hours, the mitigation design must be addressed before production go-live.
+If the compliance team requires physical S3 byte removal within 24 hours, the nightly batch volume must be quantified and mitigations designed before production go-live.
 
 ### 12.7 Operational Scalability
 
@@ -969,7 +1027,7 @@ Monitoring scales linearly with pod count: each of the 21 pods emits independent
 | ClickHouse Keeper | Moderate | Raft write ceiling; multi-subsystem blast radius | Profile Keeper write pressure at 7 shards in PoC |
 | S3 storage | Strong | Write amplification cost (row size TBD) | S3 scales independently |
 | Query concurrency | Moderate | No connection pooling; merge/query RAM contention | chproxy; dedicated query cluster (Section 4.5) |
-| Compliance deletes | Critical | 2,555 OPTIMIZE calls per user at production volume | Resolve Open Decision #17; prefer logical inaccessibility |
+| Compliance deletes | High | 210 calls per user (30 typical partitions); multi-user batch volume is the binding constraint | Quantify users/batch; resolve Open Decision #11; prefer logical inaccessibility |
 | Operational | Moderate | Single CHI blast radius; manual SIGHUP rotation | Automate rotation; split CHI if pod count grows |
 
 ---
