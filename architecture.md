@@ -45,6 +45,7 @@
    - 8.4 [KafkaEngine At-Least-Once Delivery](#84-kafkaengine-at-least-once-delivery)
    - 8.5 [Keeper as a Multi-Subsystem Dependency](#85-keeper-as-a-multi-subsystem-dependency)
    - 8.6 [S3 Availability Equals INSERT Availability](#86-s3-availability-equals-insert-availability)
+   - 8.7 [Zero-Copy Replication Production Stability](#87-zero-copy-replication-production-stability)
 9. [Open Decisions](#9-open-decisions)
 10. [Recommended Versions](#10-recommended-versions)
 11. [Implementation Roadmap](#11-implementation-roadmap)
@@ -640,6 +641,8 @@ The correct engine for this architecture is `ReplicatedMergeTree` with `allow_re
 
 > **Action required**: The implementation team must explicitly review and acknowledge this warning before YAML authoring begins.
 
+> **Critical**: `allow_remote_fs_zero_copy_replication = 1` has a documented history of data loss bugs in production. Read [Section 8.7](#87-zero-copy-replication-production-stability) before proceeding. The decision to use zero-copy replication vs. full replication (doubled S3 cost, no GC race risk) must be made explicitly — see [Open Decision #12](#9-open-decisions).
+
 ### 8.2 s3_plain Incompatibility
 
 `s3_plain` uses an immutable flat path layout. `ReplicatedMergeTree` merges write new data parts to new S3 paths. `s3_plain` cannot handle path mutations required by merges. **Always use the standard `s3` disk type** (see [Section 5.4](#54-s3-disk-type-selection)).
@@ -778,6 +781,81 @@ Write-through caching means S3 is in the critical write path. If S3 becomes unre
 
 **Mitigation**: S3 HA (MinIO erasure coding or NetApp redundancy) must be operational before this architecture can claim production HA. Design and validate S3 HA independently before deploying ClickHouse.
 
+### 8.7 Zero-Copy Replication Production Stability
+
+**Rating: Critical**
+
+`allow_remote_fs_zero_copy_replication = 1` has a documented history of data loss bugs in production deployments. This is the single highest-risk configuration choice in this architecture and must be explicitly treated as such before any YAML authoring begins. See [Open Decision #12](#9-open-decisions).
+
+#### The Core Problem: GC Race Conditions
+
+Zero-copy replication eliminates inter-replica S3 data transfer by having both replicas reference the same S3 objects. When a merge completes:
+
+1. The merging replica writes the new merged part to S3 and registers it in Keeper.
+2. The other replica acknowledges the new part via Keeper and updates its local metadata.
+3. The original S3 parts are now candidates for garbage collection.
+4. Keeper-coordinated lock checks determine whether it is safe to delete the old S3 objects.
+
+**The race**: the lock check and S3 DELETE are not atomic. Under production load — concurrent merges, high Keeper write pressure, or Keeper leader elections — the sequence can interleave incorrectly:
+
+- A lock check returns "safe to delete" before the other replica has finished acquiring its read lock on the old parts.
+- The old S3 objects are deleted.
+- The other replica attempts to read the now-missing S3 objects → the part is broken → **data is permanently lost**.
+
+This failure mode requires no misconfiguration. It is a timing-sensitive race in the GC coordination protocol that is triggered by normal production workload conditions.
+
+#### ClickHouse Inc.'s Own Signal
+
+ClickHouse Cloud does not use zero-copy replication. ClickHouse Inc. built **SharedMergeTree** specifically to replace it — a fundamentally different design where S3 object metadata is managed by a dedicated metadata service, removing GC coordination from the ClickHouse server entirely. ClickHouse Inc. would not have invested in an entirely new storage engine if zero-copy replication were reliable at production scale.
+
+> Open-source ClickHouse does not include SharedMergeTree (see [Section 8.1](#81-sharedmergetree-not-available-in-open-source-clickhouse)) — this architecture cannot use it. But the signal is unambiguous: the team that maintains ClickHouse does not trust zero-copy replication for their own production product.
+
+#### Keeper znode Accumulation
+
+Zero-copy replication creates a Keeper znode for every S3 part reference — both live parts and GC candidates. At the ingest rates in this architecture (`kafka_max_block_size = 1M` rows at ~57,870 rows/sec → multiple new parts per second across the cluster before background merges consolidate them), the Keeper znode tree for zero-copy locks grows rapidly. Interrupted merges, Keeper leader elections, and partial GC runs all leave stale znodes behind.
+
+These accumulate over time, increasing Keeper memory usage and degrading znode traversal latency for all Keeper clients (replication, S3Queue, GC). ClickHouse provides no automated cleanup for stale zero-copy lock znodes. Periodic manual cleanup is required in production, and there is no safe, zero-downtime procedure for running it under live load.
+
+This compounds [Section 8.5](#85-keeper-as-a-multi-subsystem-dependency): Keeper is already a single point of failure for replication, S3Queue, and GC. Zero-copy replication adds unbounded znode growth as a fourth failure mode against the same ensemble.
+
+#### Interaction with Compliance Deletes
+
+`OPTIMIZE TABLE PARTITION FINAL` — the mechanism this architecture relies on for physical user-ID deletion — is the highest-exposure operation under zero-copy replication. It:
+
+1. Reads all parts in a partition → writes one new merged part to S3.
+2. Registers the new merged part via Keeper.
+3. Initiates GC of **all** original parts simultaneously.
+
+Step 3 is maximum-exposure for GC races: every part in the partition is simultaneously a GC candidate. At production partition sizes (~143 GB compressed / shard / day), a race here results in loss of an entire partition's worth of data, not a single small part. This is the same operation executed 210 times per user during a nightly compliance delete (see [Section 8.3](#83-compliance-mutations-with-zero-copy-replication)).
+
+#### NVMe Cache Masking
+
+The NVMe write-through cache (`cache_on_write_operations = 1`) introduces a secondary failure mode: if S3 objects are erroneously GC'd while valid NVMe cache entries for those objects still exist, queries will continue to return results from the NVMe cache — **masking the data loss**. The data appears intact until the NVMe cache entry is evicted, at which point the S3 fetch fails. This can delay detection by hours and complicates any post-incident recovery.
+
+#### The Alternative: Full Replication
+
+Disabling zero-copy (`allow_remote_fs_zero_copy_replication = 0`) restores standard ClickHouse replication: each replica independently writes and owns its S3 data. There are no GC race conditions. Replication lag recovery is handled by ClickHouse's established fetcher mechanism, which is battle-tested across a large number of production deployments.
+
+| | Zero-copy (`= 1`) | Full replication (`= 0`) |
+|---|---|---|
+| S3 storage per shard | 1× (shared between replicas) | 2× (one copy per replica) |
+| Inter-replica network transfer on lag | None | Fetcher copies missing parts |
+| GC race condition risk | Present; documented data loss incidents | None |
+| Data loss surface area | Merges, mutations, OPTIMIZE FINAL, GC | None beyond standard CH replication bugs |
+| Production track record | Multiple known incidents; ClickHouse Inc. abandoned it | Well-understood; widely deployed at scale |
+| Keeper znode growth | Unbounded; requires manual cleanup | No additional znode overhead |
+
+**Cost implication**: Full replication doubles S3 storage for the cache cluster. At 7 shards, the shared zero-copy prefix becomes 7 independent per-replica prefixes with 2× the data. This is the primary trade-off and must be budgeted before a decision is made.
+
+#### Conditions for Retaining Zero-Copy
+
+If storage cost makes full replication infeasible, zero-copy may be retained only under all of the following conditions:
+
+1. **Extended PoC validation**: run a ≥72-hour merge-heavy workload with `allow_remote_fs_zero_copy_replication = 1`, including repeated `OPTIMIZE TABLE PARTITION FINAL` operations. Continuously monitor S3 object counts against Keeper-registered part counts for divergence (missing objects = data loss). Any divergence fails the PoC.
+2. **Keeper znode monitoring**: instrument an alert on the zero-copy lock znode count under `clickhouse/zero_copy_locks/` in Keeper. Alert before Keeper memory saturation.
+3. **GC health check**: a scheduled script must cross-reference S3 objects against `system.parts` on all replicas, flagging orphaned S3 objects and missing-but-registered parts. Must run at least daily.
+4. **Migration runbook**: document the procedure for switching from zero-copy to full replication under live traffic (config change → allow replicas to fetch missing parts → verify parity) before going to production.
+
 ---
 
 ## 9. Open Decisions
@@ -793,6 +871,7 @@ The following decisions must be resolved before YAML authoring begins. Each bloc
 | 3 | **Keeper deployment method**: `ClickHouseKeeperInstallation` CRD or standalone StatefulSet? Confirm supported method for the target Altinity operator version. | Keeper YAML |
 | 4 | **Keeper node count**: 3 (tolerates 1 failure) or 5 (tolerates 2 failures, recommended for production)? | Keeper YAML, node reservation |
 | 5 | **Kubernetes namespace strategy**: one `ClickHouseInstallation` per environment (dev/staging/prod), or one CHI across all environments? | CHI YAML structure |
+| 12 | **Zero-copy vs full replication**: use `allow_remote_fs_zero_copy_replication = 1` (1× S3 storage per shard; documented data loss risk; requires ≥72h PoC validation — see [Section 8.7](#87-zero-copy-replication-production-stability)) or `= 0` (2× S3 storage per shard; no GC race risk; standard replication semantics)? **This is an architectural decision, not a configuration detail — it must be made explicitly and before YAML authoring begins.** | Storage policy YAML, cache cluster DDL, S3 cost budget |
 
 ### Table and Schema Decisions
 
@@ -1021,6 +1100,7 @@ Monitoring scales linearly with pod count: each of the 21 pods emits independent
 
 | Dimension | Rating | Primary Bottleneck | Scale-out Path |
 |---|---|---|---|
+| Zero-copy replication | Critical | GC race conditions can cause permanent data loss; Keeper znode accumulation degrades over time | Resolve Open Decision #12 (zero-copy vs full replication) before YAML authoring; see Section 8.7 |
 | Ingest tier | Moderate | Kafka repartitioning to add shards | Add shards (2→4); repartition Kafka |
 | Cache cluster — vertical | Strong | NVMe sizing requires row size input (Decision #8) | Larger PVCs; S3 absorbs growth |
 | Cache cluster — horizontal | High risk | No automated resharding; multi-hour manual migration | Establish resharding runbook before capacity ceiling |
