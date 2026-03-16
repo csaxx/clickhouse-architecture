@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# quickstart.sh — Download NYC crash + weather datasets, start the stack, and
-# load data into StarRocks via Redpanda (Routine Load), persisted on MinIO.
+# load-quickstart.sh — Download NYC crash + weather datasets and load them into
+# StarRocks via Redpanda (Routine Load), persisted on MinIO.
+#
+# Run docker-compose-up.sh first to ensure the stack is ready.
 #
 # Usage:
-#   chmod +x quickstart.sh
-#   ./quickstart.sh
+#   chmod +x load-quickstart.sh
+#   ./load-quickstart.sh
 #
-# Run from the directory containing docker-compose.yml.
 # Requires: docker, curl, mysql (or mariadb) CLI client.
 
 set -euo pipefail
@@ -65,102 +66,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Start Docker Compose
+# 2. Create Redpanda topics
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 2: Starting Docker Compose ==="
-cd "$SCRIPT_DIR"
-docker compose up -d
-echo "  stack started."
-
-# ---------------------------------------------------------------------------
-# 3. Wait for starrocks-init to complete successfully
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 3: Waiting for StarRocks init container to finish ==="
-while true; do
-  STATUS=$(docker inspect --format='{{.State.Status}}' starrocks-init 2>/dev/null || echo "missing")
-  if [ "$STATUS" = "exited" ]; then
-    EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' starrocks-init)
-    if [ "$EXIT_CODE" != "0" ]; then
-      echo "ERROR: starrocks-init exited with code $EXIT_CODE"
-      docker compose logs starrocks-init
-      exit 1
-    fi
-    echo "  starrocks-init completed successfully."
-    break
-  fi
-  echo "  starrocks-init status: $STATUS — waiting..."
-  sleep 5
-done
-
-# ---------------------------------------------------------------------------
-# 4. Wait for StarRocks FE MySQL port to be reachable from host
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 4: Waiting for StarRocks FE (host port $SR_PORT) ==="
-until sr_sql -e "SELECT 1" >/dev/null 2>&1; do
-  echo "  not ready yet, retrying in 5s..."
-  sleep 5
-done
-echo "  StarRocks FE is reachable."
-
-# ---------------------------------------------------------------------------
-# 4b. Wait for CN alive + tablet scheduler capacity report
-# ---------------------------------------------------------------------------
-# "Alive: true" only means the FE received the CN heartbeat. The tablet
-# scheduler processes the CN's capacity report in a separate step that can
-# lag 10-30s behind. CREATE TABLE fails with "Cluster has no available
-# capacity" until that report arrives. We poll until the CN row appears
-# with Alive: true, then keep retrying a dummy CREATE TABLE until the
-# scheduler accepts it, then drop the dummy table.
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 4b: Waiting for CN alive ==="
-until sr_sql -e "SHOW COMPUTE NODES\G" 2>/dev/null | grep -q "Alive: true"; do
-  echo "  no alive CN yet, retrying in 5s..."
-  sleep 5
-done
-echo "  CN heartbeat received. Waiting for tablet scheduler capacity report..."
-
-sr_sql -e "DROP DATABASE IF EXISTS _qs_probe;" 2>/dev/null || true
-sr_sql -e "CREATE DATABASE IF NOT EXISTS _qs_probe;" 2>/dev/null || true
-until sr_sql _qs_probe -e "
-  CREATE TABLE _probe (k INT) ENGINE=OLAP
-  DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1
-  PROPERTIES ('replication_num'='1');
-" 2>/dev/null; do
-  echo "  scheduler not ready yet, retrying in 5s..."
-  sleep 5
-done
-sr_sql -e "DROP DATABASE IF EXISTS _qs_probe;" 2>/dev/null || true
-echo "  Cluster has capacity — proceeding."
-
-# ---------------------------------------------------------------------------
-# 5. Wait for Redpanda
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 5: Waiting for Redpanda ==="
-until docker exec redpanda rpk cluster health 2>/dev/null | grep -q "Healthy.*true"; do
-  echo "  Redpanda not ready yet, retrying in 5s..."
-  sleep 5
-done
-echo "  Redpanda is ready."
-
-# ---------------------------------------------------------------------------
-# 6. Create Redpanda topics
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 6: Creating Redpanda topics ==="
+echo "=== Step 2: Creating Redpanda topics ==="
 docker exec redpanda rpk topic create "$CRASH_TOPIC"   --partitions 3 --replicas 1 2>&1 | grep -v "already exists" || true
 docker exec redpanda rpk topic create "$WEATHER_TOPIC" --partitions 3 --replicas 1 2>&1 | grep -v "already exists" || true
 echo "  topics ready: $CRASH_TOPIC, $WEATHER_TOPIC"
 
 # ---------------------------------------------------------------------------
-# 7. Create quickstart database and tables
+# 3. Create quickstart database and tables
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 7: Creating quickstart database and tables ==="
+echo "=== Step 3: Creating quickstart database and tables ==="
 
 sr_sql <<'SQL'
 CREATE DATABASE IF NOT EXISTS quickstart;
@@ -220,10 +138,10 @@ SQL
 echo "  tables created."
 
 # ---------------------------------------------------------------------------
-# 8. Create Routine Load jobs
+# 4. Create Routine Load jobs
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 8: Creating Routine Load jobs ==="
+echo "=== Step 4: Creating Routine Load jobs ==="
 
 # Crash data: 29 CSV columns (positional), CRASH_DATE computed from first two.
 # Columns skipped (persons/cyclists/motorists injured/killed, CF 3-5, VT 3-5)
@@ -320,7 +238,7 @@ COLUMNS (
 )
 PROPERTIES (
     "desired_concurrent_number" = "3",
-    "max_batch_rows"            = "100000",
+    "max_batch_rows"            = "200000",
     "max_batch_interval"        = "30",
     "max_error_number"          = "500",
     "format"                    = "CSV",
@@ -339,30 +257,30 @@ echo "  Routine Load jobs created."
 echo "  Check status: SHOW ROUTINE LOAD\\G"
 
 # ---------------------------------------------------------------------------
-# 9. Produce CSV data → Redpanda topics (skip header row with tail -n +2)
+# 5. Produce CSV data → Redpanda topics (skip header row with tail -n +2)
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 9: Producing crash data → $CRASH_TOPIC ==="
+echo "=== Step 5: Producing crash data → $CRASH_TOPIC ==="
 echo "  (streaming ~423k rows from $CRASH_FILE — may take a minute)"
 tail -n +2 "$CRASH_FILE" \
   | docker exec -i redpanda rpk topic produce "$CRASH_TOPIC" --compression snappy
 echo "  crash data produced."
 
 echo ""
-echo "=== Step 10: Producing weather data → $WEATHER_TOPIC ==="
+echo "=== Step 6: Producing weather data → $WEATHER_TOPIC ==="
 tail -n +2 "$WEATHER_FILE" \
   | docker exec -i redpanda rpk topic produce "$WEATHER_TOPIC" --compression snappy
 echo "  weather data produced."
 
 # ---------------------------------------------------------------------------
-# 10. Wait for Routine Load to commit batches, then verify row counts
+# 6. Wait for Routine Load to commit batches, then verify row counts
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 11: Waiting 60s for Routine Load batches to commit ==="
+echo "=== Step 7: Waiting 60s for Routine Load batches to commit ==="
 sleep 60
 
 echo ""
-echo "=== Step 12: Verifying row counts ==="
+echo "=== Step 8: Verifying row counts ==="
 sr_sql quickstart -e "
 SELECT 'crashdata'   AS table_name, COUNT(*) AS rows FROM crashdata
 UNION ALL
@@ -370,7 +288,7 @@ SELECT 'weatherdata' AS table_name, COUNT(*) AS rows FROM weatherdata;
 "
 
 echo ""
-echo "=== Quickstart complete ==="
-echo "  Connect:  mysql -h 127.0.0.1 -P 9030 -u root quickstart"
+echo "=== Load complete ==="
+echo "  Connect:     mysql -h 127.0.0.1 -P 9030 -u root quickstart"
 echo "  CloudBeaver: http://localhost:8978  (cbadmin / cbadmin)"
 echo "  MinIO:       http://localhost:9001  (minioadmin / minioadmin)"
