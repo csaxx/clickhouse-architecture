@@ -69,11 +69,13 @@ services:
       - "9030:9030"   # MySQL wire protocol (client connection point)
     volumes:
       - fe-meta:/opt/starrocks/fe/meta
-    entrypoint: >
-      /bin/bash -c "
-        printf '\nrun_mode = shared_data\ncloud_native_storage_type = S3\npriority_networks = 172.20.0.0/24\nJAVA_OPTS=\"-Xmx2048m -Xms2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=200\"\n'
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        printf '\nrun_mode = shared_data\ncloud_native_storage_type = S3\npriority_networks = 172.20.0.0/24\n' \
+          >> /opt/starrocks/fe/conf/fe.conf &&
         exec /opt/starrocks/fe/bin/start_fe.sh
-      "
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -96,6 +98,10 @@ services:
       - "8040:8040"   # CN HTTP API
       - "9050:9050"   # CN heartbeat
       - "9060:9060"   # CN thrift
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
       - cn-cache:/opt/starrocks/cn/datacache
     entrypoint: >

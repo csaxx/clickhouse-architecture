@@ -123,16 +123,16 @@ until sr_sql -e "SHOW COMPUTE NODES\G" 2>/dev/null | grep -q "Alive: true"; do
 done
 echo "  CN heartbeat received. Waiting for tablet scheduler capacity report..."
 
+sr_sql -e "DROP DATABASE IF EXISTS _qs_probe;" 2>/dev/null || true
 sr_sql -e "CREATE DATABASE IF NOT EXISTS _qs_probe;" 2>/dev/null || true
 until sr_sql _qs_probe -e "
-  CREATE TABLE IF NOT EXISTS _probe (k INT) ENGINE=OLAP
+  CREATE TABLE _probe (k INT) ENGINE=OLAP
   DUPLICATE KEY(k) DISTRIBUTED BY HASH(k) BUCKETS 1
   PROPERTIES ('replication_num'='1');
 " 2>/dev/null; do
   echo "  scheduler not ready yet, retrying in 5s..."
   sleep 5
 done
-sr_sql -e "DROP TABLE IF EXISTS _qs_probe._probe;" 2>/dev/null || true
 sr_sql -e "DROP DATABASE IF EXISTS _qs_probe;" 2>/dev/null || true
 echo "  Cluster has capacity — proceeding."
 
@@ -259,7 +259,7 @@ FROM KAFKA (
     "kafka_broker_list" = "redpanda:29092",
     "kafka_topic"       = "crashdata-topic",
     "kafka_partitions"  = "0,1,2",
-    "kafka_offsets"     = "OFFSET_BEGINNING"
+    "kafka_offsets"     = "OFFSET_BEGINNING,OFFSET_BEGINNING,OFFSET_BEGINNING"
 );
 SQL
 
@@ -331,7 +331,7 @@ FROM KAFKA (
     "kafka_broker_list" = "redpanda:29092",
     "kafka_topic"       = "weatherdata-topic",
     "kafka_partitions"  = "0,1,2",
-    "kafka_offsets"     = "OFFSET_BEGINNING"
+    "kafka_offsets"     = "OFFSET_BEGINNING,OFFSET_BEGINNING,OFFSET_BEGINNING"
 );
 SQL
 
