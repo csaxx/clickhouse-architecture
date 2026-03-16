@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# load-crash-data.sh — Download the NYC crash dataset and produce it into
+# load-data-crash.sh — Download the NYC crash dataset and produce it into
 # the crashdata-topic Redpanda topic.
 #
 # Run docker-compose-up.sh first to ensure the stack is ready.
 # Run redpanda-create-topics.sh first to create the topic.
 #
 # Usage:
-#   chmod +x load-crash-data.sh
-#   ./load-crash-data.sh
+#   chmod +x load-data-crash.sh
+#   ./load-data-crash.sh
 #
 # Requires: docker, curl.
 

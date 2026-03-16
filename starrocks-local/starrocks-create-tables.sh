@@ -10,8 +10,8 @@
 # Prerequisites:
 #   1. ./docker-compose-up.sh          — stack running and healthy
 #   2. ./redpanda-create-topics.sh     — topics exist
-#   3. ./load-crash-data.sh            — crash CSV in crashdata-topic
-#   4. ./load-weather-data.sh          — weather CSV in weatherdata-topic
+#   3. ./load-data-crash.sh            — crash CSV in crashdata-topic
+#   4. ./load-data-weather.sh          — weather CSV in weatherdata-topic
 #   (site_clicks data is produced separately via gen.py)
 #
 # Usage:

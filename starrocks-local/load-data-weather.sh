@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# load-weather-data.sh — Download the NOAA weather dataset and produce it into
+# load-data-weather.sh — Download the NOAA weather dataset and produce it into
 # the weatherdata-topic Redpanda topic.
 #
 # Run docker-compose-up.sh first to ensure the stack is ready.
 # Run redpanda-create-topics.sh first to create the topic.
 #
 # Usage:
-#   chmod +x load-weather-data.sh
-#   ./load-weather-data.sh
+#   chmod +x load-data-weather.sh
+#   ./load-data-weather.sh
 #
 # Requires: docker, curl.
 
