@@ -1,27 +1,16 @@
 #!/usr/bin/env bash
-# load-quickstart.sh — Download NYC crash + weather datasets and load them into
-# StarRocks via Redpanda (Routine Load), persisted on MinIO.
+# load-quickstart-starrocks.sh — Create the quickstart database, tables, and
+# Routine Load jobs in StarRocks, then verify row counts after ingestion.
 #
-# Run docker-compose-up.sh first to ensure the stack is ready.
+# Run load-quickstart-redpanda.sh first to populate the Redpanda topics.
 #
 # Usage:
-#   chmod +x load-quickstart.sh
-#   ./load-quickstart.sh
+#   chmod +x load-quickstart-starrocks.sh
+#   ./load-quickstart-starrocks.sh
 #
-# Requires: docker, curl, mysql (or mariadb) CLI client.
+# Requires: docker, mysql (or mariadb) CLI client.
 
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="$SCRIPT_DIR/data"
-
-CRASH_URL="https://raw.githubusercontent.com/StarRocks/demo/master/documentation-samples/quickstart/datasets/NYPD_Crash_Data.csv"
-WEATHER_URL="https://raw.githubusercontent.com/StarRocks/demo/master/documentation-samples/quickstart/datasets/72505394728.csv"
-CRASH_FILE="$DATA_DIR/NYPD_Crash_Data.csv"
-WEATHER_FILE="$DATA_DIR/72505394728.csv"
-
-CRASH_TOPIC="crashdata-topic"
-WEATHER_TOPIC="weatherdata-topic"
 
 SR_HOST="127.0.0.1"
 SR_PORT="9030"
@@ -44,41 +33,9 @@ sr_sql() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Download data files (skip if already present)
+# 1. Create quickstart database and tables
 # ---------------------------------------------------------------------------
-echo "=== Step 1: Downloading datasets ==="
-mkdir -p "$DATA_DIR"
-
-if [ -f "$CRASH_FILE" ]; then
-  echo "  crash data already present ($CRASH_FILE)"
-else
-  echo "  downloading NYC crash data (~96 MB)..."
-  curl -fL --progress-bar -o "$CRASH_FILE" "$CRASH_URL"
-  echo "  done."
-fi
-
-if [ -f "$WEATHER_FILE" ]; then
-  echo "  weather data already present ($WEATHER_FILE)"
-else
-  echo "  downloading NOAA weather data..."
-  curl -fL --progress-bar -o "$WEATHER_FILE" "$WEATHER_URL"
-  echo "  done."
-fi
-
-# ---------------------------------------------------------------------------
-# 2. Create Redpanda topics
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 2: Creating Redpanda topics ==="
-docker exec redpanda rpk topic create "$CRASH_TOPIC"   --partitions 3 --replicas 1 2>&1 | grep -v "already exists" || true
-docker exec redpanda rpk topic create "$WEATHER_TOPIC" --partitions 3 --replicas 1 2>&1 | grep -v "already exists" || true
-echo "  topics ready: $CRASH_TOPIC, $WEATHER_TOPIC"
-
-# ---------------------------------------------------------------------------
-# 3. Create quickstart database and tables
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 3: Creating quickstart database and tables ==="
+echo "=== Step 1: Creating quickstart database and tables ==="
 
 sr_sql <<'SQL'
 CREATE DATABASE IF NOT EXISTS quickstart;
@@ -138,10 +95,10 @@ SQL
 echo "  tables created."
 
 # ---------------------------------------------------------------------------
-# 4. Create Routine Load jobs
+# 2. Create Routine Load jobs
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 4: Creating Routine Load jobs ==="
+echo "=== Step 2: Creating Routine Load jobs ==="
 
 # Crash data: 29 CSV columns (positional), CRASH_DATE computed from first two.
 # Columns skipped (persons/cyclists/motorists injured/killed, CF 3-5, VT 3-5)
@@ -257,38 +214,22 @@ echo "  Routine Load jobs created."
 echo "  Check status: SHOW ROUTINE LOAD\\G"
 
 # ---------------------------------------------------------------------------
-# 5. Produce CSV data → Redpanda topics (skip header row with tail -n +2)
+# 3. Wait for Routine Load to commit batches, then verify row counts
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 5: Producing crash data → $CRASH_TOPIC ==="
-echo "  (streaming ~423k rows from $CRASH_FILE — may take a minute)"
-tail -n +2 "$CRASH_FILE" \
-  | docker exec -i redpanda rpk topic produce "$CRASH_TOPIC" --compression snappy
-echo "  crash data produced."
-
-echo ""
-echo "=== Step 6: Producing weather data → $WEATHER_TOPIC ==="
-tail -n +2 "$WEATHER_FILE" \
-  | docker exec -i redpanda rpk topic produce "$WEATHER_TOPIC" --compression snappy
-echo "  weather data produced."
-
-# ---------------------------------------------------------------------------
-# 6. Wait for Routine Load to commit batches, then verify row counts
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Step 7: Waiting 60s for Routine Load batches to commit ==="
+echo "=== Step 3: Waiting 60s for Routine Load batches to commit ==="
 sleep 60
 
 echo ""
-echo "=== Step 8: Verifying row counts ==="
+echo "=== Step 4: Verifying row counts ==="
 sr_sql quickstart -e "
-SELECT 'crashdata'   AS table_name, COUNT(*) AS rows FROM crashdata
+SELECT 'crashdata'   AS table_name, COUNT(*) AS row_count FROM crashdata
 UNION ALL
-SELECT 'weatherdata' AS table_name, COUNT(*) AS rows FROM weatherdata;
+SELECT 'weatherdata' AS table_name, COUNT(*) AS row_count FROM weatherdata;
 "
 
 echo ""
-echo "=== Load complete ==="
+echo "=== StarRocks load complete ==="
 echo "  Connect:     mysql -h 127.0.0.1 -P 9030 -u root quickstart"
 echo "  CloudBeaver: http://localhost:8978  (cbadmin / cbadmin)"
 echo "  MinIO:       http://localhost:9001  (minioadmin / minioadmin)"
