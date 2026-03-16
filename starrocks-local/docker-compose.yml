@@ -1,0 +1,232 @@
+version: "3.8"
+
+networks:
+  sr-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  minio-data:
+  fe-meta:
+  cn-cache:
+  redpanda-data:
+  cloudbeaver-data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3 backend (source of truth for all StarRocks data)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    networks: [sr-net]
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO console (browser UI)
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # One-shot: create the StarRocks bucket in MinIO
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    networks: [sr-net]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/starrocks &&
+        echo 'MinIO bucket ready.'
+      "
+
+  # ---------------------------------------------------------------------------
+  # StarRocks FE — metadata, query coordination, Routine Load scheduling
+  # Config is appended to the image default via entrypoint to avoid CRLF issues
+  # on Windows (mounted config files with \r\n break shell-level fe.conf parsing).
+  # ---------------------------------------------------------------------------
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:latest
+    container_name: starrocks-fe
+    networks: [sr-net]
+    ports:
+      - "8030:8030"   # HTTP API
+      - "9020:9020"   # internal RPC
+      - "9030:9030"   # MySQL wire protocol (client connection point)
+    volumes:
+      - fe-meta:/opt/starrocks/fe/meta
+    entrypoint: >
+      /bin/bash -c "
+        printf '\nrun_mode = shared_data\ncloud_native_storage_type = S3\npriority_networks = 172.20.0.0/24\nJAVA_OPTS=\"-Xmx2048m -Xms2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=200\"\n'
+        exec /opt/starrocks/fe/bin/start_fe.sh
+      "
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # Check both HTTP (fast) and MySQL port (slower — confirms full readiness)
+      test: ["CMD-SHELL", "curl -sf http://localhost:8030/api/health && bash -c 'cat /dev/null > /dev/tcp/127.0.0.1/9030' 2>/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 90s
+
+  # ---------------------------------------------------------------------------
+  # StarRocks CN — stateless compute node + local data cache (shared-data mode)
+  # ---------------------------------------------------------------------------
+  starrocks-cn:
+    image: starrocks/cn-ubuntu:latest
+    container_name: starrocks-cn
+    networks: [sr-net]
+    ports:
+      - "8040:8040"   # CN HTTP API
+      - "9050:9050"   # CN heartbeat
+      - "9060:9060"   # CN thrift
+    volumes:
+      - cn-cache:/opt/starrocks/cn/datacache
+    entrypoint: >
+      /bin/bash -c "
+        printf '\ndatacache_enable = true\ndatacache_disk_path = /opt/starrocks/cn/datacache\ndatacache_disk_size = 10737418240\ndatacache_populate_mode = auto\nmem_limit = 4294967296\n'
+          >> /opt/starrocks/cn/conf/cn.conf &&
+        exec /opt/starrocks/cn/bin/start_cn.sh
+      "
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+
+  # One-shot: register CN with FE, create storage volume, set as default
+  # mariadb instead of mysql:latest — MySQL 9.x defaults to caching_sha2_password
+  # which StarRocks does not support; MariaDB client uses mysql_native_password.
+  starrocks-init:
+    image: mariadb:latest
+    container_name: starrocks-init
+    networks: [sr-net]
+    depends_on:
+      starrocks-cn:
+        condition: service_started
+    entrypoint: >
+      /bin/bash -c "
+        echo 'Waiting for FE MySQL port to accept connections...' &&
+        until mariadb -h starrocks-fe -P 9030 -u root --connect-timeout=5 -e 'SELECT 1' > /dev/null 2>&1; do
+          echo '  FE not ready yet, retrying in 5s...'; sleep 5
+        done &&
+
+        echo 'FE ready. Giving CN 15s to start...' && sleep 15 &&
+
+        echo 'Registering CN with FE...' &&
+        mariadb -h starrocks-fe -P 9030 -u root -e \"ALTER SYSTEM ADD COMPUTE NODE 'starrocks-cn:9050';\" &&
+
+        echo 'Waiting 20s for CN registration to complete...' && sleep 20 &&
+
+        echo 'Creating S3 storage volume (MinIO)...' &&
+        mariadb -h starrocks-fe -P 9030 -u root -e \"CREATE STORAGE VOLUME IF NOT EXISTS minio_vol TYPE = S3 LOCATIONS = ('s3://starrocks/') PROPERTIES ('enabled' = 'true', 'aws.s3.region' = 'us-east-1', 'aws.s3.endpoint' = 'http://minio:9000', 'aws.s3.access_key' = 'minioadmin', 'aws.s3.secret_key' = 'minioadmin', 'aws.s3.enable_ssl' = 'false', 'aws.s3.enable_path_style_access' = 'true');\" &&
+
+        echo 'Setting minio_vol as default storage volume...' &&
+        mariadb -h starrocks-fe -P 9030 -u root -e \"SET minio_vol AS DEFAULT STORAGE VOLUME;\" &&
+
+        echo 'Enabling query profiler (global)...' &&
+        mariadb -h starrocks-fe -P 9030 -u root -e \"SET GLOBAL enable_profile = true; SET GLOBAL pipeline_profile_level = 1;\" &&
+
+        echo '=== StarRocks init complete ==='
+      "
+
+  # ---------------------------------------------------------------------------
+  # Redpanda — Kafka-compatible broker for Routine Load testing
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda
+    networks: [sr-net]
+    ports:
+      - "9092:9092"    # Kafka API (host access)
+      - "29092:29092"  # Kafka API (inter-container; used by StarRocks Routine Load)
+      - "8082:8082"    # Pandaproxy REST API
+      - "9644:9644"    # Redpanda Admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+      - --schema-registry-addr=0.0.0.0:8081
+      - --mode=dev-container
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy.*true'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Redpanda Console — web UI for Kafka topics, consumer groups, messages
+  # ---------------------------------------------------------------------------
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: redpanda-console
+    networks: [sr-net]
+    ports:
+      - "8080:8080"   # Redpanda Console UI
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: "http://redpanda:8081"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # One-shot: write GlobalConfiguration/data-sources.json into the CloudBeaver
+  # workspace volume so the StarRocks connection is pre-configured on first run.
+  cloudbeaver-init:
+    image: alpine:latest
+    container_name: cloudbeaver-init
+    networks: [sr-net]
+    volumes:
+      - cloudbeaver-data:/workspace
+    entrypoint: >
+      /bin/sh -c "
+        mkdir -p /workspace/GlobalConfiguration/.dbeaver &&
+        printf '{\"folders\":{},\"connections\":{\"mysql-starrocks\":{\"provider\":\"mysql\",\"driver\":\"mysql8\",\"name\":\"StarRocks (Local)\",\"save-password\":true,\"configuration\":{\"host\":\"starrocks-fe\",\"port\":\"9030\",\"database\":\"\",\"user\":\"root\",\"password\":\"\",\"url\":\"jdbc:mysql://starrocks-fe:9030/\",\"configurationType\":\"MANUAL\",\"type\":\"dev\",\"closeIdleConnection\":true,\"properties\":{\"useSSL\":\"false\",\"allowPublicKeyRetrieval\":\"true\"}}}}}' > /workspace/GlobalConfiguration/.dbeaver/data-sources.json &&
+        echo 'CloudBeaver data sources pre-configured.'
+      "
+
+  # ---------------------------------------------------------------------------
+  # CloudBeaver — web-based SQL query UI; connects to StarRocks via MySQL protocol
+  # CB_ADMIN_NAME/CB_ADMIN_PASSWORD skip the first-run setup wizard.
+  # The StarRocks connection is pre-loaded by cloudbeaver-init via GlobalConfiguration.
+  # ---------------------------------------------------------------------------
+  cloudbeaver:
+    image: dbeaver/cloudbeaver:latest
+    container_name: cloudbeaver
+    networks: [sr-net]
+    ports:
+      - "8978:8978"   # CloudBeaver web UI
+    environment:
+      CB_ADMIN_NAME: cbadmin
+      CB_ADMIN_PASSWORD: cbadmin
+    volumes:
+      - cloudbeaver-data:/opt/cloudbeaver/workspace
+    depends_on:
+      cloudbeaver-init:
+        condition: service_completed_successfully
+      starrocks-fe:
+        condition: service_healthy
