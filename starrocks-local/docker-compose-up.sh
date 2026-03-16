@@ -83,12 +83,12 @@ echo "  StarRocks FE is reachable."
 # scheduler accepts it, then drop the dummy table.
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 4: Waiting for CN alive ==="
-until sr_sql -e "SHOW COMPUTE NODES\G" 2>/dev/null | grep -q "Alive: true"; do
-  echo "  no alive CN yet, retrying in 5s..."
+echo "=== Step 4: Waiting for both CNs alive ==="
+until [ "$(sr_sql -e "SHOW COMPUTE NODES\G" 2>/dev/null | grep -c "Alive: true")" -ge 2 ]; do
+  echo "  waiting for 2 alive CNs, retrying in 5s..."
   sleep 5
 done
-echo "  CN heartbeat received. Waiting for tablet scheduler capacity report..."
+echo "  Both CN heartbeats received. Waiting for tablet scheduler capacity report..."
 
 sr_sql -e "DROP DATABASE IF EXISTS _qs_probe;" 2>/dev/null || true
 sr_sql -e "CREATE DATABASE IF NOT EXISTS _qs_probe;" 2>/dev/null || true

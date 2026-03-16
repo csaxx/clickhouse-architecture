@@ -43,6 +43,7 @@ SQL
 
 sr_sql quickstart <<'SQL'
 CREATE TABLE IF NOT EXISTS crashdata (
+    COLLISION_ID                  INT,          -- PRIMARY KEY; must be first column
     CRASH_DATE                    DATETIME,
     BOROUGH                       STRING,
     ZIP_CODE                      STRING,
@@ -54,21 +55,22 @@ CREATE TABLE IF NOT EXISTS crashdata (
     OFF_STREET_NAME               STRING,
     CONTRIBUTING_FACTOR_VEHICLE_1 STRING,
     CONTRIBUTING_FACTOR_VEHICLE_2 STRING,
-    COLLISION_ID                  INT,
     VEHICLE_TYPE_CODE_1           STRING,
     VEHICLE_TYPE_CODE_2           STRING
 )
 ENGINE = OLAP
-DUPLICATE KEY(CRASH_DATE)
+PRIMARY KEY(COLLISION_ID)
 DISTRIBUTED BY HASH(COLLISION_ID) BUCKETS 3
 PROPERTIES (
-    "replication_num" = "1",
-    "storage_volume"  = "minio_vol"
+    "replication_num"         = "1",
+    "storage_volume"          = "minio_vol",
+    "enable_persistent_index" = "true",
+    "persistent_index_type"   = "CLOUD_NATIVE"
 );
 
 CREATE TABLE IF NOT EXISTS weatherdata (
-    WEATHER_DATE                DATETIME,
-    NAME                        STRING,
+    WEATHER_DATE                DATETIME,     -- PRIMARY KEY col 1; already first
+    NAME                        STRING,       -- PRIMARY KEY col 2 (station name)
     HourlyDewPointTemperature   STRING,
     HourlyDryBulbTemperature    STRING,
     HourlyPrecipitation         STRING,
@@ -84,11 +86,13 @@ CREATE TABLE IF NOT EXISTS weatherdata (
     HourlyWindSpeed             STRING
 )
 ENGINE = OLAP
-DUPLICATE KEY(WEATHER_DATE)
+PRIMARY KEY(WEATHER_DATE, NAME)
 DISTRIBUTED BY HASH(WEATHER_DATE) BUCKETS 3
 PROPERTIES (
-    "replication_num" = "1",
-    "storage_volume"  = "minio_vol"
+    "replication_num"         = "1",
+    "storage_volume"          = "minio_vol",
+    "enable_persistent_index" = "true",
+    "persistent_index_type"   = "CLOUD_NATIVE"
 );
 SQL
 

@@ -9,8 +9,10 @@ networks:
 
 volumes:
   minio-data:
-  fe-meta:
+  fe1-meta:
+  fe2-meta:
   cn-cache:
+  cn2-cache:
   redpanda-data:
   cloudbeaver-data:
 
@@ -55,20 +57,20 @@ services:
       "
 
   # ---------------------------------------------------------------------------
-  # StarRocks FE — metadata, query coordination, Routine Load scheduling
+  # StarRocks FE1 — primary FOLLOWER: metadata, query coordination, Routine Load
   # Config is appended to the image default via entrypoint to avoid CRLF issues
   # on Windows (mounted config files with \r\n break shell-level fe.conf parsing).
   # ---------------------------------------------------------------------------
-  starrocks-fe:
+  starrocks-fe1:
     image: starrocks/fe-ubuntu:latest
-    container_name: starrocks-fe
+    container_name: starrocks-fe1
     networks: [sr-net]
     ports:
       - "8030:8030"   # HTTP API
       - "9020:9020"   # internal RPC
       - "9030:9030"   # MySQL wire protocol (client connection point)
     volumes:
-      - fe-meta:/opt/starrocks/fe/meta
+      - fe1-meta:/opt/starrocks/fe/meta
     entrypoint:
       - /bin/bash
       - -c
@@ -88,11 +90,44 @@ services:
       start_period: 90s
 
   # ---------------------------------------------------------------------------
-  # StarRocks CN — stateless compute node + local data cache (shared-data mode)
+  # StarRocks FE2 — OBSERVER: syncs metadata from FE1, handles query routing.
+  # Starts with --helper pointing at FE1's edit-log port (9010).
+  # Not a Raft voter — losing FE2 does not affect leader election.
   # ---------------------------------------------------------------------------
-  starrocks-cn:
+  starrocks-fe2:
+    image: starrocks/fe-ubuntu:latest
+    container_name: starrocks-fe2
+    networks: [sr-net]
+    ports:
+      - "8031:8030"   # HTTP API
+      - "9021:9020"   # internal RPC
+      - "9031:9030"   # MySQL wire protocol
+    volumes:
+      - fe2-meta:/opt/starrocks/fe/meta
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        printf '\nrun_mode = shared_data\ncloud_native_storage_type = S3\npriority_networks = 172.20.0.0/24\n' \
+          >> /opt/starrocks/fe/conf/fe.conf &&
+        exec /opt/starrocks/fe/bin/start_fe.sh --helper starrocks-fe1:9010
+    depends_on:
+      starrocks-fe1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8030/api/health && bash -c 'cat /dev/null > /dev/tcp/127.0.0.1/9030' 2>/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 90s
+
+  # ---------------------------------------------------------------------------
+  # StarRocks CN1 — stateless compute node + local data cache (shared-data mode)
+  # mem_limit and datacache sized for a two-CN local setup (≈2 GB each).
+  # ---------------------------------------------------------------------------
+  starrocks-cn1:
     image: starrocks/cn-ubuntu:latest
-    container_name: starrocks-cn
+    container_name: starrocks-cn1
     networks: [sr-net]
     ports:
       - "8040:8040"   # CN HTTP API
@@ -106,15 +141,42 @@ services:
       - cn-cache:/opt/starrocks/cn/datacache
     entrypoint: >
       /bin/bash -c "
-        printf '\ndatacache_enable = true\ndatacache_disk_path = /opt/starrocks/cn/datacache\ndatacache_disk_size = 10737418240\ndatacache_populate_mode = auto\nmem_limit = 4294967296\n'
+        printf '\ndatacache_enable = true\ndatacache_disk_path = /opt/starrocks/cn/datacache\ndatacache_disk_size = 5368709120\ndatacache_populate_mode = auto\nmem_limit = 2147483648\n'
           >> /opt/starrocks/cn/conf/cn.conf &&
         exec /opt/starrocks/cn/bin/start_cn.sh
       "
     depends_on:
-      starrocks-fe:
+      starrocks-fe1:
         condition: service_healthy
 
-  # One-shot: register CN with FE, create storage volume, set as default
+  # ---------------------------------------------------------------------------
+  # StarRocks CN2 — second compute node; same config as CN1, distinct ports.
+  # ---------------------------------------------------------------------------
+  starrocks-cn2:
+    image: starrocks/cn-ubuntu:latest
+    container_name: starrocks-cn2
+    networks: [sr-net]
+    ports:
+      - "8041:8040"   # CN HTTP API
+      - "9051:9050"   # CN heartbeat
+      - "9061:9060"   # CN thrift
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - cn2-cache:/opt/starrocks/cn/datacache
+    entrypoint: >
+      /bin/bash -c "
+        printf '\ndatacache_enable = true\ndatacache_disk_path = /opt/starrocks/cn/datacache\ndatacache_disk_size = 5368709120\ndatacache_populate_mode = auto\nmem_limit = 2147483648\n'
+          >> /opt/starrocks/cn/conf/cn.conf &&
+        exec /opt/starrocks/cn/bin/start_cn.sh
+      "
+    depends_on:
+      starrocks-fe1:
+        condition: service_healthy
+
+  # One-shot: register FE2 as observer, register both CNs, create storage volume.
   # mariadb instead of mysql:latest — MySQL 9.x defaults to caching_sha2_password
   # which StarRocks does not support; MariaDB client uses mysql_native_password.
   starrocks-init:
@@ -122,30 +184,36 @@ services:
     container_name: starrocks-init
     networks: [sr-net]
     depends_on:
-      starrocks-cn:
+      starrocks-cn1:
+        condition: service_started
+      starrocks-cn2:
         condition: service_started
     entrypoint: >
       /bin/bash -c "
         echo 'Waiting for FE MySQL port to accept connections...' &&
-        until mariadb -h starrocks-fe -P 9030 -u root --connect-timeout=5 -e 'SELECT 1' > /dev/null 2>&1; do
+        until mariadb -h starrocks-fe1 -P 9030 -u root --connect-timeout=5 -e 'SELECT 1' > /dev/null 2>&1; do
           echo '  FE not ready yet, retrying in 5s...'; sleep 5
         done &&
 
-        echo 'FE ready. Giving CN 15s to start...' && sleep 15 &&
+        echo 'Registering FE2 as observer...' &&
+        mariadb -h starrocks-fe1 -P 9030 -u root -e \"ALTER SYSTEM ADD OBSERVER 'starrocks-fe2:9010';\" &&
 
-        echo 'Registering CN with FE...' &&
-        mariadb -h starrocks-fe -P 9030 -u root -e \"ALTER SYSTEM ADD COMPUTE NODE 'starrocks-cn:9050';\" &&
+        echo 'FE ready. Giving CNs 15s to start...' && sleep 15 &&
+
+        echo 'Registering CNs with FE...' &&
+        mariadb -h starrocks-fe1 -P 9030 -u root -e \"ALTER SYSTEM ADD COMPUTE NODE 'starrocks-cn1:9050';\" &&
+        mariadb -h starrocks-fe1 -P 9030 -u root -e \"ALTER SYSTEM ADD COMPUTE NODE 'starrocks-cn2:9050';\" &&
 
         echo 'Waiting 20s for CN registration to complete...' && sleep 20 &&
 
         echo 'Creating S3 storage volume (MinIO)...' &&
-        mariadb -h starrocks-fe -P 9030 -u root -e \"CREATE STORAGE VOLUME IF NOT EXISTS minio_vol TYPE = S3 LOCATIONS = ('s3://starrocks/') PROPERTIES ('enabled' = 'true', 'aws.s3.region' = 'us-east-1', 'aws.s3.endpoint' = 'http://minio:9000', 'aws.s3.access_key' = 'minioadmin', 'aws.s3.secret_key' = 'minioadmin', 'aws.s3.enable_ssl' = 'false', 'aws.s3.enable_path_style_access' = 'true');\" &&
+        mariadb -h starrocks-fe1 -P 9030 -u root -e \"CREATE STORAGE VOLUME IF NOT EXISTS minio_vol TYPE = S3 LOCATIONS = ('s3://starrocks/') PROPERTIES ('enabled' = 'true', 'aws.s3.region' = 'us-east-1', 'aws.s3.endpoint' = 'http://minio:9000', 'aws.s3.access_key' = 'minioadmin', 'aws.s3.secret_key' = 'minioadmin', 'aws.s3.enable_ssl' = 'false', 'aws.s3.enable_path_style_access' = 'true');\" &&
 
         echo 'Setting minio_vol as default storage volume...' &&
-        mariadb -h starrocks-fe -P 9030 -u root -e \"SET minio_vol AS DEFAULT STORAGE VOLUME;\" &&
+        mariadb -h starrocks-fe1 -P 9030 -u root -e \"SET minio_vol AS DEFAULT STORAGE VOLUME;\" &&
 
         echo 'Enabling query profiler (global)...' &&
-        mariadb -h starrocks-fe -P 9030 -u root -e \"SET GLOBAL enable_profile = true; SET GLOBAL pipeline_profile_level = 1;\" &&
+        mariadb -h starrocks-fe1 -P 9030 -u root -e \"SET GLOBAL enable_profile = true; SET GLOBAL pipeline_profile_level = 1;\" &&
 
         echo '=== StarRocks init complete ==='
       "
@@ -211,7 +279,7 @@ services:
     entrypoint: >
       /bin/sh -c "
         mkdir -p /workspace/GlobalConfiguration/.dbeaver &&
-        printf '{\"folders\":{},\"connections\":{\"mysql-starrocks\":{\"provider\":\"mysql\",\"driver\":\"mysql8\",\"name\":\"StarRocks (Local)\",\"save-password\":true,\"configuration\":{\"host\":\"starrocks-fe\",\"port\":\"9030\",\"database\":\"\",\"user\":\"root\",\"password\":\"\",\"url\":\"jdbc:mysql://starrocks-fe:9030/\",\"configurationType\":\"MANUAL\",\"type\":\"dev\",\"closeIdleConnection\":true,\"properties\":{\"useSSL\":\"false\",\"allowPublicKeyRetrieval\":\"true\"}}}}}' > /workspace/GlobalConfiguration/.dbeaver/data-sources.json &&
+        printf '{\"folders\":{},\"connections\":{\"mysql-starrocks\":{\"provider\":\"mysql\",\"driver\":\"mysql8\",\"name\":\"StarRocks (Local)\",\"save-password\":true,\"configuration\":{\"host\":\"starrocks-fe1\",\"port\":\"9030\",\"database\":\"\",\"user\":\"root\",\"password\":\"\",\"url\":\"jdbc:mysql://starrocks-fe:9030/\",\"configurationType\":\"MANUAL\",\"type\":\"dev\",\"closeIdleConnection\":true,\"properties\":{\"useSSL\":\"false\",\"allowPublicKeyRetrieval\":\"true\"}}}}}' > /workspace/GlobalConfiguration/.dbeaver/data-sources.json &&
         echo 'CloudBeaver data sources pre-configured.'
       "
 
@@ -234,5 +302,5 @@ services:
     depends_on:
       cloudbeaver-init:
         condition: service_completed_successfully
-      starrocks-fe:
+      starrocks-fe1:
         condition: service_healthy

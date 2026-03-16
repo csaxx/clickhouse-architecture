@@ -4,28 +4,31 @@ A minimal single-machine Docker Compose environment for evaluating StarRocks sha
 
 ## What This Deploys
 
-| Container | Image | Purpose |
-|---|---|---|
-| `minio` | `minio/minio` | S3 backend (source of truth for StarRocks data) |
-| `minio-init` | `minio/mc` | One-shot bucket creation |
-| `starrocks-fe` | `starrocks/fe-ubuntu:latest` | Frontend: metadata, query coordination, Routine Load scheduling |
-| `starrocks-cn` | `starrocks/cn-ubuntu:latest` | Compute Node: stateless compute + local NVMe data cache (no tablet storage) |
-| `starrocks-init` | `mariadb:latest` | One-shot SQL init: registers CN, creates storage volume, enables profiler |
-| `redpanda` | `redpandadata/redpanda` | Kafka-compatible broker for Routine Load testing |
+| Container          | Image | Purpose |
+|--------------------|---|---|
+| `minio`            | `minio/minio` | S3 backend (source of truth for StarRocks data) |
+| `minio-init`       | `minio/mc` | One-shot bucket creation |
+| `starrocks-fe1`    | `starrocks/fe-ubuntu:latest` | FE1 (FOLLOWER/leader): metadata, query coordination, Routine Load scheduling |
+| `starrocks-fe2`    | `starrocks/fe-ubuntu:latest` | FE2 (OBSERVER): metadata replica, additional query routing; not a Raft voter |
+| `starrocks-cn1`    | `starrocks/cn-ubuntu:latest` | CN1: stateless compute + local NVMe data cache (shared-data mode) |
+| `starrocks-cn2`    | `starrocks/cn-ubuntu:latest` | CN2: second compute node; same config as CN1 |
+| `starrocks-init`   | `mariadb:latest` | One-shot SQL init: registers FE2 observer + both CNs, creates storage volume, enables profiler |
+| `redpanda`         | `redpandadata/redpanda` | Kafka-compatible broker for Routine Load testing |
 | `redpanda-console` | `redpandadata/console` | Redpanda web UI: topics, consumer groups, messages |
 | `cloudbeaver-init` | `alpine` | One-shot: write pre-configured StarRocks connection into CloudBeaver workspace |
-| `cloudbeaver` | `dbeaver/cloudbeaver` | Web SQL IDE; connects to StarRocks via MySQL protocol |
+| `cloudbeaver`      | `dbeaver/cloudbeaver` | Web SQL IDE; connects to StarRocks via MySQL protocol |
 
-**Approximate memory budget**: 7–9 GB RAM total. Reduce JVM heap and CN memory limit further if needed (see Tuning section).
+**Approximate memory budget**: 10–13 GB RAM total. Reduce CN `mem_limit` and `datacache_disk_size` in `docker-compose.yml` if the machine is constrained (see Tuning section).
 
 ### Web UIs
 
-| URL | Service | Credentials                 |
-|---|---|-----------------------------|
+| URL | Service | Credentials |
+|---|---|---|
 | http://localhost:9001 | MinIO Console | `minioadmin` / `minioadmin` |
-| http://localhost:8080 | Redpanda Console | none                        |
-| http://localhost:8030 | StarRocks FE web UI + query profiler | 'root' / ''   |
-| http://localhost:8978 | CloudBeaver SQL IDE | `cbadmin` / `cbadmin`       |
+| http://localhost:8080 | Redpanda Console | none |
+| http://localhost:8030 | StarRocks FE1 web UI + query profiler | `root` / `` |
+| http://localhost:8031 | StarRocks FE2 web UI | `root` / `` |
+| http://localhost:8978 | CloudBeaver SQL IDE | `cbadmin` / `cbadmin` |
 
 ---
 
@@ -44,30 +47,40 @@ A minimal single-machine Docker Compose environment for evaluating StarRocks sha
 
 ```
 starrocks-local/
-├── docker-compose.yml   — full stack definition
-├── quickstart.sh        — downloads datasets and loads them via Redpanda
-├── README.md            — this file
-└── data/                — created by quickstart.sh; git-ignored
+├── docker-compose.yml              — full stack definition
+├── docker-compose-up.sh            — start stack + wait for full readiness
+├── docker-compose-down.sh          — tear down stack and remove all volumes
+├── load-quickstart-redpanda.sh     — download datasets, create topics, produce to Redpanda
+├── load-quickstart-starrocks.sh    — create DB/tables/Routine Load jobs, verify counts
+├── README.md                       — this file
+└── data/                           — created by load-quickstart-redpanda.sh; git-ignored
 ```
 
 ---
 
 ## Step 1 — Start the Environment
 
+Use the provided script, which starts the stack and polls each service until fully ready:
+
+```bash
+chmod +x docker-compose-up.sh
+./docker-compose-up.sh
+```
+
+The script confirms:
+1. `starrocks-init` exits with code 0 (FE2 observer + both CNs registered, storage volume created)
+2. StarRocks FE1 MySQL port reachable from host
+3. Both CNs heartbeating (`Alive: true`) and tablet scheduler accepting new tables
+4. Redpanda cluster healthy
+
+Alternatively, start manually and tail the init container:
+
 ```bash
 docker compose up -d
-
-# Watch the one-shot init container to confirm successful setup
 docker compose logs -f starrocks-init
 ```
 
-The `starrocks-init` container exits with code 0 on success. Look for:
-
-```
-=== StarRocks init complete ===
-```
-
-Full startup takes **2–4 minutes** on first run (image pulls + FE/BE JVM startup).
+Look for `=== StarRocks init complete ===`. Full startup takes **3–5 minutes** on first run (image pulls + FE/CN JVM startup).
 
 ---
 
@@ -79,13 +92,21 @@ Connect to StarRocks using the MySQL client (no password):
 mysql -h 127.0.0.1 -P 9030 -u root
 ```
 
-### Check CN is registered and alive
+### Check FE topology
+
+```sql
+SHOW FRONTENDS\G
+```
+
+Expected: two rows — FE1 with `IsMaster: true`, FE2 with `Role: OBSERVER`.
+
+### Check both CNs are registered and alive
 
 ```sql
 SHOW COMPUTE NODES\G
 ```
 
-Expected: one row with `Alive: true` and `SystemDecommissioned: false`. If `Alive` is `false`, wait another 30 seconds and retry — CN heartbeat registration can take up to a minute after `ADD COMPUTE NODE`.
+Expected: **two rows**, both with `Alive: true` and `SystemDecommissioned: false`. If either shows `Alive: false`, wait 30 seconds and retry — CN heartbeat registration can lag up to a minute after `ADD COMPUTE NODE`.
 
 ### Check storage volume
 
@@ -97,7 +118,6 @@ SHOW STORAGE VOLUMES;
 ### Check cluster health
 
 ```sql
-SHOW FRONTENDS\G
 SHOW PROC '/statistic'\G
 ```
 
@@ -112,6 +132,7 @@ The **StarRocks (Local)** connection is pre-configured — it appears in the lef
 **Useful first queries in CloudBeaver**:
 
 ```sql
+SHOW FRONTENDS\G
 SHOW COMPUTE NODES\G
 SHOW STORAGE VOLUMES\G
 SHOW DATABASES;
@@ -157,7 +178,7 @@ PRIMARY KEY (event_id)
 PARTITION BY RANGE(event_date) (
     -- partitions created dynamically
 )
-DISTRIBUTED BY HASH(event_id) BUCKETS 3   -- 3× BE count; 1 BE here → 3 buckets
+DISTRIBUTED BY HASH(event_id) BUCKETS 6   -- 3 buckets × 2 CNs
 ORDER BY (event_id)
 PROPERTIES (
     "replication_num"              = "1",
@@ -169,7 +190,7 @@ PROPERTIES (
     "dynamic_partition.start"      = "-30",
     "dynamic_partition.end"        = "3",
     "dynamic_partition.prefix"     = "p",
-    "dynamic_partition.buckets"    = "3",
+    "dynamic_partition.buckets"    = "6",
     "partition_ttl"                = "90 DAY"
 );
 ```
@@ -208,7 +229,7 @@ CREATE ROUTINE LOAD test.events_load ON events
 COLUMNS TERMINATED BY ",",
 COLUMNS (event_id, user_id, event_date, eviction_date, event_ts, payload)
 PROPERTIES (
-    "desired_concurrent_number" = "1",
+    "desired_concurrent_number" = "2",
     "max_batch_rows"            = "100000",
     "max_batch_interval"        = "10",
     "max_error_number"          = "100",
@@ -219,7 +240,7 @@ FROM KAFKA (
     "kafka_broker_list" = "redpanda:29092",
     "kafka_topic"       = "events-topic",
     "kafka_partitions"  = "0,1,2",
-    "kafka_offsets"     = "OFFSET_BEGINNING"
+    "kafka_offsets"     = "OFFSET_BEGINNING,OFFSET_BEGINNING,OFFSET_BEGINNING"
 );
 
 -- Check job status
@@ -387,39 +408,41 @@ This exercises the full ingest path: Kafka broker → StarRocks FE scheduling �
 | NYC crash data (NYPD) | NYC OpenData via StarRocks demo repo | ~423k | ~96 MB |
 | NOAA weather data | NOAA Local Climatological Data | ~8k | ~6 MB |
 
-### Run the quickstart script
+### Run the quickstart scripts
 
-`quickstart.sh` (in this directory) handles everything end-to-end:
+Two scripts handle the load end-to-end. Run them in order after `docker-compose-up.sh`:
 
-1. Downloads CSV files into `data/` (skipped if already present)
-2. Starts the stack with `docker compose up -d`
-3. Waits for `starrocks-init` to complete
-4. Waits for StarRocks FE and Redpanda to be reachable
-5. Creates Redpanda topics `crashdata-topic` and `weatherdata-topic`
-6. Creates the `quickstart` database and tables in StarRocks
-7. Creates Routine Load jobs (one per topic)
-8. Streams CSV rows (header stripped) into Redpanda via `rpk topic produce`
-9. Waits 60 s for the first Routine Load batch to commit, then prints row counts
+**1. Populate Redpanda** (download CSVs + produce to topics):
 
 ```bash
-chmod +x quickstart.sh
-./quickstart.sh
+chmod +x load-quickstart-redpanda.sh
+./load-quickstart-redpanda.sh
 ```
 
-Expected output at the end:
+This downloads the CSV files into `data/` (skipped if already present), creates the Redpanda topics, and streams both datasets into them.
 
-```
-=== Verifying row counts ===
-+--------------+--------+
-| table_name   | rows   |
-+--------------+--------+
-| crashdata    | 423725 |
-| weatherdata  |   8784 |
-+--------------+--------+
+**2. Load into StarRocks** (create tables + Routine Load jobs + verify):
+
+```bash
+chmod +x load-quickstart-starrocks.sh
+./load-quickstart-starrocks.sh
 ```
 
-> **Note**: row counts appear after the 60 s wait. If they show 0, the Routine Load
-> batches are still committing — wait another 30 s and re-run the SELECT manually.
+This creates the `quickstart` database and tables, creates two Routine Load jobs, waits 60 s for the first batch to commit, then prints row counts.
+
+Expected output at the end of the second script:
+
+```
+=== Step 4: Verifying row counts ===
++--------------+-----------+
+| table_name   | row_count |
++--------------+-----------+
+| crashdata    |    423725 |
+| weatherdata  |      8784 |
++--------------+-----------+
+```
+
+> **Note**: if counts show 0, the Routine Load batches are still committing — wait another 30 s and re-run the SELECT manually.
 
 ### Table schemas
 
@@ -427,6 +450,7 @@ Expected output at the end:
 
 ```sql
 CREATE TABLE IF NOT EXISTS crashdata (
+    COLLISION_ID                  INT,        -- PRIMARY KEY; must be first column
     CRASH_DATE                    DATETIME,   -- combined from CSV CRASH DATE + CRASH TIME
     BOROUGH                       STRING,
     ZIP_CODE                      STRING,
@@ -438,14 +462,18 @@ CREATE TABLE IF NOT EXISTS crashdata (
     OFF_STREET_NAME               STRING,
     CONTRIBUTING_FACTOR_VEHICLE_1 STRING,
     CONTRIBUTING_FACTOR_VEHICLE_2 STRING,
-    COLLISION_ID                  INT,
     VEHICLE_TYPE_CODE_1           STRING,
     VEHICLE_TYPE_CODE_2           STRING
 )
 ENGINE = OLAP
-DUPLICATE KEY(CRASH_DATE)
+PRIMARY KEY(COLLISION_ID)
 DISTRIBUTED BY HASH(COLLISION_ID) BUCKETS 3
-PROPERTIES ("replication_num" = "1", "storage_volume" = "minio_vol");
+PROPERTIES (
+    "replication_num"         = "1",
+    "storage_volume"          = "minio_vol",
+    "enable_persistent_index" = "true",
+    "persistent_index_type"   = "CLOUD_NATIVE"
+);
 ```
 
 **`quickstart.weatherdata`** — DUPLICATE KEY model, distributed by `WEATHER_DATE`.
@@ -454,8 +482,8 @@ in the Routine Load `COLUMNS` clause:
 
 ```sql
 CREATE TABLE IF NOT EXISTS weatherdata (
-    WEATHER_DATE              DATETIME,
-    NAME                      STRING,
+    WEATHER_DATE              DATETIME,   -- PRIMARY KEY col 1 (already first)
+    NAME                      STRING,     -- PRIMARY KEY col 2 (station name)
     HourlyDewPointTemperature STRING,
     HourlyDryBulbTemperature  STRING,
     HourlyPrecipitation       STRING,
@@ -471,9 +499,14 @@ CREATE TABLE IF NOT EXISTS weatherdata (
     HourlyWindSpeed           STRING
 )
 ENGINE = OLAP
-DUPLICATE KEY(WEATHER_DATE)
+PRIMARY KEY(WEATHER_DATE, NAME)
 DISTRIBUTED BY HASH(WEATHER_DATE) BUCKETS 3
-PROPERTIES ("replication_num" = "1", "storage_volume" = "minio_vol");
+PROPERTIES (
+    "replication_num"         = "1",
+    "storage_volume"          = "minio_vol",
+    "enable_persistent_index" = "true",
+    "persistent_index_type"   = "CLOUD_NATIVE"
+);
 ```
 
 ### Monitor Routine Load
@@ -557,22 +590,27 @@ paths for the `quickstart` database alongside the `test` database from earlier s
 
 ## Useful Commands
 
-### Restart cleanly (preserving data)
+### Start / stop
 
 ```bash
+# Start stack and wait for full readiness
+./docker-compose-up.sh
+
+# Full teardown — removes all volumes and data
+./docker-compose-down.sh
+
+# Restart without losing data
 docker compose restart
-```
-
-### Full teardown including all data
-
-```bash
-docker compose down -v
 ```
 
 ### Connect to StarRocks
 
 ```bash
+# FE1
 mysql -h 127.0.0.1 -P 9030 -u root
+
+# FE2 (observer — same data, different entry point)
+mysql -h 127.0.0.1 -P 9031 -u root
 ```
 
 ### Routine Load status
@@ -601,22 +639,25 @@ Open **http://localhost:9001** in a browser. Bucket `starrocks` contains all Sta
 
 ---
 
-## Tuning for Very Low-Resource Machines
+## Tuning for Low-Resource Machines
 
-If the machine has less than 8 GB RAM available for Docker, edit the `entrypoint:` printf strings in `docker-compose.yml`:
+If the machine has less than 10 GB RAM available for Docker, reduce per-component limits in `docker-compose.yml`:
 
-**FE** — reduce JVM heap (in the `starrocks-fe` entrypoint):
-```
-JAVA_OPTS=\"-Xmx1024m -Xms1024m -XX:+UseG1GC\"
-```
+**CN1 and CN2** — reduce `mem_limit` and `datacache_disk_size` in both `starrocks-cn1` and `starrocks-cn2` entrypoints:
 
-**CN** — reduce memory and cache (in the `starrocks-cn` entrypoint):
 ```
-mem_limit = 2147483648
-datacache_disk_size = 5368709120
+mem_limit = 1073741824        # 1 GB (down from 2 GB)
+datacache_disk_size = 2684354560  # 2.5 GB (down from 5 GB)
 ```
 
-**Redpanda** — reduce allocation (in the `redpanda` command list):
+**FE1 and FE2** — add a `JAVA_OPTS` line to each FE's `fe.conf` via the `printf` in the entrypoint:
+
+```
+JAVA_OPTS=-Xmx1024m -Xms512m -XX:+UseG1GC
+```
+
+**Redpanda** — reduce allocation in the `redpanda` command list:
+
 ```yaml
   - --memory=256M
 ```
@@ -638,16 +679,19 @@ Each step above maps directly to an architecture concern in `starrocks-architect
 | Field-level `UPDATE` | §1.4, §13 |
 | Pipe file tracking / no double-load | §4.2, §8.4 |
 | S3 object layout in MinIO browser | §3.3 |
-| CN auto-recovery (stop/start cn container) | §6.3 |
+| CN auto-recovery (stop/start one CN container) | §6.3 |
+| FE observer metadata sync (check FE2 after restart) | §6.2 |
+| Query routing via FE2 (connect to port 9031) | §3.4 |
 
 ---
 
 ## Known Limitations of This Local Setup
 
-- **1 FE, 1 CN**: FE quorum (Section 6.2) and CN redistribution (Section 12.2) cannot be tested. Use a 3-FE, 3-CN setup on a larger machine for those.
-- **MinIO single-node**: not erasure-coded; data loss if the container is deleted without a volume backup. This is expected for a test environment.
+- **1 FOLLOWER FE + 1 OBSERVER FE**: Raft quorum requires 3 FOLLOWER nodes (§6.2). FE1 is the permanent leader; FE2 is a non-voting OBSERVER. Leader failover cannot be tested without a 3-FOLLOWER setup on a larger machine.
+- **2 CNs, no CN redistribution**: CN scale-out behavior (§12.2) requires adding/removing CNs from a live cluster. This can be tested manually by stopping one CN container and observing recovery.
+- **MinIO single-node**: not erasure-coded; data loss if the container is deleted without a volume backup. Expected for a test environment.
 - **No TLS/auth**: StarRocks root has no password, MinIO uses default credentials, Redpanda runs in dev mode with no SASL. Do not expose these ports outside the local machine.
-- **No resource groups**: StarRocks Resource Groups (Section 12.5) require more than one CN to be meaningful.
+- **No resource groups**: StarRocks Resource Groups (§12.5) require more than one CN to be meaningful — now partially testable with 2 CNs.
 - **datacache_populate_mode**: Behavior of `auto` varies by version. Check the StarRocks release notes for the version pulled for the precise semantics when evaluating Open Decision #12.
 
 ---
