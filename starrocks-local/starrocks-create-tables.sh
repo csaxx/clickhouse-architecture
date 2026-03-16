@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
-# load-quickstart-starrocks.sh — Create the quickstart database, tables, and
-# Routine Load jobs in StarRocks, then verify row counts after ingestion.
+# starrocks-create-tables.sh — Create databases, tables, and Routine Load jobs
+# in StarRocks, then verify row counts after the initial ingest batches commit.
 #
-# Run load-quickstart-redpanda.sh first to populate the Redpanda topics.
+# Covers three datasets:
+#   • crashdata    — NYC vehicle collision records (CSV via crashdata-topic)
+#   • weatherdata  — NOAA hourly weather observations (CSV via weatherdata-topic)
+#   • site_clicks  — synthetic click-stream events (JSON via site-clicks)
+#
+# Prerequisites:
+#   1. ./docker-compose-up.sh          — stack running and healthy
+#   2. ./redpanda-create-topics.sh     — topics exist
+#   3. ./load-crash-data.sh            — crash CSV in crashdata-topic
+#   4. ./load-weather-data.sh          — weather CSV in weatherdata-topic
+#   (site_clicks data is produced separately via gen.py)
 #
 # Usage:
-#   chmod +x load-quickstart-starrocks.sh
-#   ./load-quickstart-starrocks.sh
+#   chmod +x starrocks-create-tables.sh
+#   ./starrocks-create-tables.sh
 #
 # Requires: docker, mysql (or mariadb) CLI client.
 
@@ -33,17 +43,26 @@ sr_sql() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Create quickstart database and tables
+# 1. Create databases
 # ---------------------------------------------------------------------------
-echo "=== Step 1: Creating quickstart database and tables ==="
+echo "=== Step 1: Creating databases ==="
 
 sr_sql <<'SQL'
 CREATE DATABASE IF NOT EXISTS quickstart;
 SQL
 
+echo "  databases created."
+
+# ---------------------------------------------------------------------------
+# 2. Create tables
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Step 2: Creating tables ==="
+
+# ── quickstart: crashdata + weatherdata ─────────────────────────────────────
 sr_sql quickstart <<'SQL'
 CREATE TABLE IF NOT EXISTS crashdata (
-    COLLISION_ID                  INT,          -- PRIMARY KEY; must be first column
+    COLLISION_ID                  INT,
     CRASH_DATE                    DATETIME,
     BOROUGH                       STRING,
     ZIP_CODE                      STRING,
@@ -69,8 +88,8 @@ PROPERTIES (
 );
 
 CREATE TABLE IF NOT EXISTS weatherdata (
-    WEATHER_DATE                DATETIME,     -- PRIMARY KEY col 1; already first
-    NAME                        STRING,       -- PRIMARY KEY col 2 (station name)
+    WEATHER_DATE                DATETIME,
+    NAME                        STRING,
     HourlyDewPointTemperature   STRING,
     HourlyDryBulbTemperature    STRING,
     HourlyPrecipitation         STRING,
@@ -94,19 +113,32 @@ PROPERTIES (
     "enable_persistent_index" = "true",
     "persistent_index_type"   = "CLOUD_NATIVE"
 );
+
+-- site_clicks: DUPLICATE KEY (no dedup); one bucket matches the single topic
+-- partition. Routine Load uses JSON format.
+CREATE TABLE IF NOT EXISTS site_clicks (
+    uid   BIGINT NOT NULL COMMENT "user ID",
+    site  STRING NOT NULL COMMENT "visited URL",
+    vtime BIGINT NOT NULL COMMENT "visit timestamp (unix seconds)"
+)
+ENGINE = OLAP
+DUPLICATE KEY(uid)
+DISTRIBUTED BY HASH(uid) BUCKETS 1
+PROPERTIES (
+    "replication_num" = "1",
+    "storage_volume"  = "minio_vol"
+);
 SQL
 
 echo "  tables created."
 
 # ---------------------------------------------------------------------------
-# 2. Create Routine Load jobs
+# 3. Create Routine Load jobs
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 2: Creating Routine Load jobs ==="
+echo "=== Step 3: Creating Routine Load jobs ==="
 
-# Crash data: 29 CSV columns (positional), CRASH_DATE computed from first two.
-# Columns skipped (persons/cyclists/motorists injured/killed, CF 3-5, VT 3-5)
-# are mapped to col_* temp vars that are discarded.
+# ── crash data (CSV, 29 positional columns → 14 stored) ─────────────────────
 sr_sql quickstart <<'SQL'
 CREATE ROUTINE LOAD quickstart.crash_load ON crashdata
 COLUMNS TERMINATED BY ",",
@@ -142,9 +174,7 @@ FROM KAFKA (
 );
 SQL
 
-# Weather data: 123 CSV columns, 15 stored. All non-table columns are mapped to
-# col_* temp vars. DATE is a SQL reserved word so renamed to WEATHER_DATE in the
-# table; obs_date is used as the positional temp var, then assigned.
+# ── weather data (CSV, 123 positional columns → 15 stored) ──────────────────
 sr_sql quickstart <<'SQL'
 CREATE ROUTINE LOAD quickstart.weather_load ON weatherdata
 COLUMNS TERMINATED BY ",",
@@ -214,26 +244,46 @@ FROM KAFKA (
 );
 SQL
 
+# ── site_clicks (JSON, single partition, streaming from gen.py) ──────────────
+sr_sql quickstart <<'SQL'
+CREATE ROUTINE LOAD quickstart.clicks ON site_clicks
+PROPERTIES (
+    "format"    = "JSON",
+    "jsonpaths" = "[\"$.uid\",\"$.site\",\"$.vtime\"]"
+)
+FROM KAFKA (
+    "kafka_broker_list" = "redpanda:29092",
+    "kafka_topic"       = "site-clicks",
+    "kafka_partitions"  = "0",
+    "kafka_offsets"     = "OFFSET_BEGINNING"
+);
+SQL
+
 echo "  Routine Load jobs created."
-echo "  Check status: SHOW ROUTINE LOAD\\G"
+echo "  Check status: SHOW ALL ROUTINE LOAD\\G"
 
 # ---------------------------------------------------------------------------
-# 3. Wait for Routine Load to commit batches, then verify row counts
+# 4. Wait for crash + weather batches, then verify row counts
+#    (site_clicks starts empty — populated later by gen.py)
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Step 3: Waiting 60s for Routine Load batches to commit ==="
+echo "=== Step 4: Waiting 60s for Routine Load batches to commit ==="
 sleep 60
 
 echo ""
-echo "=== Step 4: Verifying row counts ==="
+echo "=== Step 5: Verifying row counts ==="
 sr_sql quickstart -e "
 SELECT 'crashdata'   AS table_name, COUNT(*) AS row_count FROM crashdata
 UNION ALL
-SELECT 'weatherdata' AS table_name, COUNT(*) AS row_count FROM weatherdata;
+SELECT 'weatherdata' AS table_name, COUNT(*) AS row_count FROM weatherdata
+UNION ALL
+SELECT 'site_clicks' AS table_name, COUNT(*) AS row_count FROM site_clicks;
 "
 
 echo ""
-echo "=== StarRocks load complete ==="
+echo "=== StarRocks setup complete ==="
 echo "  Connect:     mysql -h 127.0.0.1 -P 9030 -u root quickstart"
 echo "  CloudBeaver: http://localhost:8978  (cbadmin / cbadmin)"
 echo "  MinIO:       http://localhost:9001  (minioadmin / minioadmin)"
+echo ""
+echo "  To populate site_clicks, run gen.py against localhost:9092 topic site-clicks"
