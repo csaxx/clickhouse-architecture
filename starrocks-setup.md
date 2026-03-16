@@ -13,6 +13,7 @@ A minimal single-machine Docker Compose environment for evaluating StarRocks sha
 | `starrocks-init` | `mariadb:latest` | One-shot SQL init: registers CN, creates storage volume, enables profiler |
 | `redpanda` | `redpandadata/redpanda` | Kafka-compatible broker for Routine Load testing |
 | `redpanda-console` | `redpandadata/console` | Redpanda web UI: topics, consumer groups, messages |
+| `cloudbeaver-init` | `alpine` | One-shot: write pre-configured StarRocks connection into CloudBeaver workspace |
 | `cloudbeaver` | `dbeaver/cloudbeaver` | Web SQL IDE; connects to StarRocks via MySQL protocol |
 
 **Approximate memory budget**: 7–9 GB RAM total. Reduce JVM heap and CN memory limit further if needed (see Tuning section).
@@ -24,7 +25,7 @@ A minimal single-machine Docker Compose environment for evaluating StarRocks sha
 | http://localhost:9001 | MinIO Console | `minioadmin` / `minioadmin` |
 | http://localhost:8080 | Redpanda Console | none                        |
 | http://localhost:8030 | StarRocks FE web UI + query profiler | 'root' / ''   |
-| http://localhost:8978 | CloudBeaver SQL IDE | set on first visit          |
+| http://localhost:8978 | CloudBeaver SQL IDE | `cbadmin` / `cbadmin`       |
 
 ---
 
@@ -131,8 +132,7 @@ services:
       - fe-meta:/opt/starrocks/fe/meta
     entrypoint: >
       /bin/bash -c "
-        printf '\nrun_mode = shared_data\npriority_networks = 172.20.0.0/24\nJAVA_OPTS=\"-Xmx2048m -Xms2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=200\"\n'
-          >> /opt/starrocks/fe/conf/fe.conf &&
+        printf '\nrun_mode = shared_data\ncloud_native_storage_type = S3\npriority_networks = 172.20.0.0/24\nJAVA_OPTS=\"-Xmx2048m -Xms2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=200\"\n'
         exec /opt/starrocks/fe/bin/start_fe.sh
       "
     depends_on:
@@ -255,8 +255,25 @@ services:
       redpanda:
         condition: service_healthy
 
+  # One-shot: write GlobalConfiguration/data-sources.json into the CloudBeaver
+  # workspace volume so the StarRocks connection is pre-configured on first run.
+  cloudbeaver-init:
+    image: alpine:latest
+    container_name: cloudbeaver-init
+    networks: [sr-net]
+    volumes:
+      - cloudbeaver-data:/workspace
+    entrypoint: >
+      /bin/sh -c "
+        mkdir -p /workspace/GlobalConfiguration/.dbeaver &&
+        printf '{\"folders\":{},\"connections\":{\"mysql-starrocks\":{\"provider\":\"mysql\",\"driver\":\"mysql8\",\"name\":\"StarRocks (Local)\",\"save-password\":true,\"configuration\":{\"host\":\"starrocks-fe\",\"port\":\"9030\",\"database\":\"\",\"user\":\"root\",\"password\":\"\",\"url\":\"jdbc:mysql://starrocks-fe:9030/\",\"configurationType\":\"MANUAL\",\"type\":\"dev\",\"closeIdleConnection\":true,\"properties\":{\"useSSL\":\"false\",\"allowPublicKeyRetrieval\":\"true\"}}}}}' > /workspace/GlobalConfiguration/.dbeaver/data-sources.json &&
+        echo 'CloudBeaver data sources pre-configured.'
+      "
+
   # ---------------------------------------------------------------------------
   # CloudBeaver — web-based SQL query UI; connects to StarRocks via MySQL protocol
+  # CB_ADMIN_NAME/CB_ADMIN_PASSWORD skip the first-run setup wizard.
+  # The StarRocks connection is pre-loaded by cloudbeaver-init via GlobalConfiguration.
   # ---------------------------------------------------------------------------
   cloudbeaver:
     image: dbeaver/cloudbeaver:latest
@@ -264,9 +281,14 @@ services:
     networks: [sr-net]
     ports:
       - "8978:8978"   # CloudBeaver web UI
+    environment:
+      CB_ADMIN_NAME: cbadmin
+      CB_ADMIN_PASSWORD: cbadmin
     volumes:
       - cloudbeaver-data:/opt/cloudbeaver/workspace
     depends_on:
+      cloudbeaver-init:
+        condition: service_completed_successfully
       starrocks-fe:
         condition: service_healthy
 ```
@@ -325,23 +347,11 @@ SHOW PROC '/statistic'\G
 
 ### Connect CloudBeaver to StarRocks
 
-Open **http://localhost:8978** in a browser.
+Open **http://localhost:8978** in a browser. Log in with `cbadmin` / `cbadmin`.
 
-**First-run wizard**: set an admin username and password for the CloudBeaver web UI itself (not StarRocks). Then click **New Connection**.
+The **StarRocks (Local)** connection is pre-configured — it appears in the left panel under **Connections**. Click it to connect. No manual setup required.
 
-**Connection settings**:
-
-| Field | Value |
-|---|---|
-| Driver | MySQL (select "MySQL 8+" from the driver list) |
-| Host | `starrocks-fe` |
-| Port | `9030` |
-| Username | `root` |
-| Password | *(leave blank)* |
-
-`starrocks-fe` resolves within the Docker network because CloudBeaver is on `sr-net`. Click **Test Connection** — it should succeed. Save and you can now run SQL against StarRocks from the browser.
-
-> **Important**: select the **MySQL** driver, not Generic JDBC or PostgreSQL. CloudBeaver uses PostgreSQL-style `$$` quoting in some introspection queries when other drivers are used, which StarRocks rejects.
+> **Note**: the connection uses the MySQL 8+ driver. Do not switch it to Generic JDBC or PostgreSQL — those send PostgreSQL-style `$$` dollar-quoting in introspection queries, which StarRocks rejects.
 
 **Useful first queries in CloudBeaver**:
 
