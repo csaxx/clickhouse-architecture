@@ -1,0 +1,99 @@
+# Client-facing Services for StarRocks FE nodes
+#
+# Architecture reference: starrocks/kubernetes/starrocks-architecture.md §4.3, §4.4
+#
+# Decision: Kubernetes Service load balancing is used (chproxy deferred).
+# (starrocks-architecture.md §4.4 for chproxy trade-off evaluation)
+#
+# ─── Service layout ───────────────────────────────────────────────────────────
+#
+# The kube-starrocks operator automatically creates an internal ClusterIP Service
+# named "starrocks-production-fe-service" that exposes FE ports 8030/9020/9030.
+# That service is used for intra-cluster communication and the init Job.
+#
+# The Services below are ADDITIONAL external-facing resources:
+#   starrocks-fe-mysql-lb  — LoadBalancer on 9030 for external SQL clients
+#   starrocks-fe-http      — ClusterIP on 8030 for Prometheus, BI tools, HTTP API
+#
+# ─── Label selector validation ────────────────────────────────────────────────
+# Labels on FE pods are set by the operator. Validate:
+#   kubectl -n starrocks get pods -l app.kubernetes.io/component=fe --show-labels
+# Update the selector below if the operator uses different label keys.
+#
+# ─── TLS ──────────────────────────────────────────────────────────────────────
+# TLS is not terminated at the Service layer. Configure a Kubernetes Ingress or
+# cloud load balancer TLS termination in front of these Services if required.
+#
+# ─── Escalation path ──────────────────────────────────────────────────────────
+# If client concurrency causes FE connection exhaustion, add chproxy in front of
+# starrocks-fe-mysql-lb. chproxy provides per-user routing, connection pooling,
+# and query queue limiting. See starrocks-architecture.md §4.4.
+
+---
+# ─── External MySQL client access ────────────────────────────────────────────
+# LoadBalancer Service on port 9030 (MySQL wire protocol).
+# Targets all FE pods; K8s health-checks remove pods that fail readiness probes.
+#
+# Clients connect with any MySQL-compatible driver:
+#   mysql -h <EXTERNAL_IP> -P 9030 -u root
+#
+# sessionAffinity: ClientIP is commented out — round-robin is preferred for
+# load distribution across 3 FE nodes under normal operations.
+# Enable if long-lived connections require consistent FE routing.
+apiVersion: v1
+kind: Service
+metadata:
+  name: starrocks-fe-mysql-lb
+  namespace: starrocks
+  labels:
+    app.kubernetes.io/part-of:   starrocks-production
+    app.kubernetes.io/component: fe
+  annotations:
+    # Uncomment to restrict the LoadBalancer to internal network only:
+    # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    # cloud.google.com/load-balancer-type: "Internal"
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name:      starrocks-production
+    app.kubernetes.io/component: fe
+  ports:
+    - name:       mysql
+      port:       9030
+      targetPort: 9030
+      protocol:   TCP
+  # sessionAffinity: ClientIP
+  # sessionAffinityConfig:
+  #   clientIP:
+  #     timeoutSeconds: 10800
+
+---
+# ─── FE HTTP interface (internal/monitoring) ──────────────────────────────────
+# ClusterIP Service on port 8030 (FE HTTP API).
+# Used by:
+#   - Prometheus scraping FE metrics: http://<cluster-ip>:8030/metrics
+#   - BI tools using HTTP protocol (e.g., Apache Superset with StarRocks HTTP driver)
+#   - Health checks: http://<cluster-ip>:8030/api/health
+#   - DDL via HTTP API (StarRocks HTTP DDL interface)
+#
+# For external HTTP access (e.g., BI tools outside the cluster), promote to
+# LoadBalancer or add an Ingress in front of this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: starrocks-fe-http
+  namespace: starrocks
+  labels:
+    app.kubernetes.io/part-of:   starrocks-production
+    app.kubernetes.io/component: fe
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name:      starrocks-production
+    app.kubernetes.io/component: fe
+  ports:
+    - name:       http
+      port:       8030
+      targetPort: 8030
+      protocol:   TCP

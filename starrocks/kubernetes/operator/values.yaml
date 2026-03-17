@@ -1,0 +1,287 @@
+# kube-starrocks Helm chart values
+#
+# Chart: kube-starrocks/kube-starrocks
+# Repo:  https://starrocks.github.io/starrocks-kubernetes-operator
+#
+# This values file installs the kube-starrocks operator AND deploys the
+# StarRocks cluster (3 FE + 7 CN, shared-data mode) in a single Helm release.
+#
+# Architecture reference: starrocks/kubernetes/starrocks-architecture.md
+#
+# ─── Install command ──────────────────────────────────────────────────────────
+#
+#   helm repo add kube-starrocks https://starrocks.github.io/starrocks-kubernetes-operator
+#   helm repo update
+#   helm install starrocks kube-starrocks/kube-starrocks \
+#     --namespace starrocks \
+#     --create-namespace \
+#     --version <pin-to-latest-stable> \
+#     -f values.yaml
+#
+# ─── PREREQUISITES ────────────────────────────────────────────────────────────
+# Apply before helm install:
+#   kubectl apply -f 00-namespace.yaml
+#   kubectl apply -f vault/serviceaccount.yaml
+#   kubectl apply -f 01-configmaps.yaml
+#   kubectl -n starrocks create secret generic starrocks-s3-credentials ...
+#
+# ─── OPEN DECISION PLACEHOLDERS ───────────────────────────────────────────────
+# Q7   Replace datacache_disk_size in 01-configmaps.yaml and cnStorageVolumes
+#      (575Gi PVC) based on active working set (target 20–30% of total dataset).
+# Q3   Replace feReplicas: 3 with 5 for extra fault tolerance (tolerates 2 failures).
+# Q12  Validate datacache_populate_mode = auto in 01-configmaps.yaml during PoC.
+# TBD  Replace Vault role/path in pod annotations.
+# TBD  Replace StorageClass names, node labels, resource limits.
+#
+# ─── CRITICAL NOTE ────────────────────────────────────────────────────────────
+# starRocksComputeNodeSpec is used — NOT starRocksBeSpec.
+# starRocksBeSpec deploys shared-nothing Backend nodes that do not connect to S3
+# and will not function in shared-data mode.
+# (starrocks-architecture.md §3.2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPERATOR
+# The operator manages the StarRocksCluster lifecycle: FE HA, CN registration,
+# rolling upgrades, and StatefulSet reconciliation.
+# ══════════════════════════════════════════════════════════════════════════════
+operator:
+  # TBD: Pin to the operator version validated against your target StarRocks
+  # version. Check the operator ↔ StarRocks version matrix in release notes.
+  # https://github.com/StarRocks/starrocks-kubernetes-operator/releases
+  image:
+    repository: starrocks/operator
+    tag: ""   # defaults to the chart's appVersion; override to pin explicitly
+
+  resources:
+    requests:
+      cpu:    "500m"
+      memory: "512Mi"
+    limits:
+      cpu:    "1"
+      memory: "1Gi"
+
+  # The operator manages StarRocksCluster CRs in all namespaces by default.
+  # To scope it to the starrocks namespace only, set watchNamespace:
+  # watchNamespace: starrocks
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STARROCKS CLUSTER
+# The chart creates a StarRocksCluster CR with these values.
+# The operator reconciles the CR into StatefulSets, Services, and other resources.
+# ══════════════════════════════════════════════════════════════════════════════
+starrocks:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # FE NODES — 3 pods (1 leader + 2 followers)
+  #
+  # Control plane and query coordination layer.
+  # Handles: metadata (BDB-JE), query planning, Routine Load scheduling,
+  # Pipe monitoring, DDL, user authentication.
+  #
+  # The operator automatically initializes replica-0 as leader and registers
+  # replicas 1–2 as FOLLOWER via ALTER SYSTEM ADD FOLLOWER.
+  #
+  # (starrocks-architecture.md §3.1, §6.2)
+  # ──────────────────────────────────────────────────────────────────────────
+  starRocksFeSpec:
+    # TBD: Pin to the latest 3.3.x patch version before production.
+    # Minimum: 3.2 (Pipe feature required). Recommended: 3.3.x (shared-data stability).
+    # Check: https://github.com/StarRocks/starrocks/releases
+    image: "starrocks/fe-ubuntu:3.3"
+
+    # TBD (Open Decision #3): 3 tolerates 1 FE failure; change to 5 for 2-failure tolerance.
+    replicas: 3
+
+    # ClusterIP: internal access only.
+    # External MySQL client access is provided by the LoadBalancer in 03-services.yaml.
+    service:
+      type: ClusterIP
+
+    # Base fe.conf (non-secret settings). Created by 01-configmaps.yaml.
+    # S3 credentials are NOT in this ConfigMap — they are in the storage volume
+    # created by the init Job (02-init-job.yaml).
+    configMapInfo:
+      configMapName: starrocks-fe-conf
+      resolveKey: fe.conf
+
+    # ─── Resource requests and limits ──────────────────────────────────────
+    # TBD: Adjust based on PoC load testing.
+    # FE is primarily memory-bound (BDB-JE metadata, query planning state).
+    # 16 GiB JVM heap (set in fe.conf JAVA_OPTS) requires ≥ 20 GiB total
+    # (heap + JVM overhead + OS buffers). 32 GiB limit provides headroom.
+    resourceRequirements:
+      requests:
+        cpu:    "4"
+        memory: "20Gi"
+      limits:
+        cpu:    "8"
+        memory: "32Gi"
+
+    # ─── Persistent metadata volume ────────────────────────────────────────
+    # FE stores Raft log and BDB-JE metadata here.
+    # MUST be a fast SSD StorageClass — Raft log I/O is latency-sensitive.
+    storageVolumes:
+      - name:             fe-meta
+        mountPath:        /opt/starrocks/fe/meta
+        # TBD: Replace with a fast SSD StorageClass available in your cluster.
+        storageClassName: standard
+        storageSize:      20Gi
+
+    # ─── Vault Agent Injector annotations ──────────────────────────────────
+    # The webhook adds a Vault Agent init container that writes
+    # /vault/secrets/s3-creds.conf (S3 credentials as conf properties) to each
+    # FE pod before StarRocks starts.
+    #
+    # NOTE: /vault/secrets/s3-creds.conf is NOT automatically merged into fe.conf.
+    # S3 credentials reach StarRocks via the storage volume DDL in 02-init-job.yaml.
+    # The Vault sidecar provides credential rotation audit and a hook point for
+    # direct conf injection if needed (see README.md §7).
+    #
+    # TBD: Replace Vault role and KV path with your environment values.
+    annotations:
+      vault.hashicorp.com/agent-inject:           "true"
+      vault.hashicorp.com/agent-init-first:       "true"
+      vault.hashicorp.com/role:                   "starrocks"
+      vault.hashicorp.com/agent-inject-secret-s3: "secret/data/starrocks/s3/credentials"
+      vault.hashicorp.com/agent-inject-template-s3: |
+        {{- with secret "secret/data/starrocks/s3/credentials" -}}
+        aws_s3_access_key = {{ .Data.data.access_key_id }}
+        aws_s3_secret_key = {{ .Data.data.secret_access_key }}
+        {{- end }}
+      vault.hashicorp.com/agent-inject-file-s3: "s3-creds.conf"
+
+    serviceAccount: starrocks
+
+    # ─── Dedicated FE nodes ────────────────────────────────────────────────
+    # REQUIRED node setup before helm install:
+    #   kubectl label node <fe-node-1..3> starrocks/role=fe
+    #   kubectl taint node <fe-node-1..3> starrocks/fe=true:NoSchedule
+    nodeSelector:
+      starrocks/role: fe
+
+    tolerations:
+      - key:      starrocks/fe
+        operator: Exists
+        effect:   NoSchedule
+
+    # ─── Anti-affinity: one FE pod per node (REQUIRED for HA) ─────────────
+    # If two FE pods land on the same node and that node fails, the 3-node
+    # Raft quorum loses 2 members simultaneously — halting all operations.
+    # Validate label keys with: kubectl -n starrocks get pods --show-labels
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name:      starrocks-production
+                app.kubernetes.io/component: fe
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # CN NODES — 7 pods (Compute Node, shared-data mode)
+  #
+  # CRITICAL: starRocksComputeNodeSpec — NOT starRocksBeSpec.
+  # starRocksBeSpec deploys shared-nothing Backend nodes that store data locally
+  # and do not connect to S3. The wrong spec produces a non-functional cluster.
+  # (starrocks-architecture.md §3.2)
+  #
+  # The operator automatically registers each CN pod with FE via
+  # ALTER SYSTEM ADD COMPUTE NODE on pod start.
+  #
+  # CN nodes are stateless compute + local NVMe data cache:
+  #   - Execute Routine Load sub-tasks (consume Kafka → write rowsets to S3)
+  #   - Execute query fragments dispatched by FE
+  #   - Maintain NVMe data cache (hot tablet pages)
+  #   - Run background compaction (Primary Key dedup; rowset merging)
+  #
+  # Scale-out: increase replicas; FE redistributes tablets automatically.
+  # No manual shard migration required. (starrocks-architecture.md §12.2)
+  # ──────────────────────────────────────────────────────────────────────────
+  starRocksComputeNodeSpec:
+    image: "starrocks/cn-ubuntu:3.3"
+
+    # 7 CNs: matches the bucket count rule (BUCKETS 21 = 3 × 7 CNs).
+    replicas: 7
+
+    service:
+      type: ClusterIP
+
+    # Base cn.conf (non-secret settings). Created by 01-configmaps.yaml.
+    configMapInfo:
+      configMapName: starrocks-cn-conf
+      resolveKey: cn.conf
+
+    # ─── Resource requests and limits ──────────────────────────────────────
+    # TBD: Adjust based on PoC load testing at full ingest rate (~8,267 rows/sec/CN).
+    # CN carries: Routine Load execution, query fragment execution, NVMe cache
+    # management, and background compaction concurrently. 8 vCPU / 32 GiB is a
+    # conservative starting point. Increase if compaction or query latency degrades.
+    # mem_limit in cn.conf (01-configmaps.yaml) must be updated if limits.memory changes.
+    resourceRequirements:
+      requests:
+        cpu:    "8"
+        memory: "32Gi"
+      limits:
+        cpu:    "16"
+        memory: "64Gi"
+
+    # ─── NVMe data cache volume ────────────────────────────────────────────
+    # Provides the local NVMe SSD data cache declared in cn.conf above.
+    #
+    # PVC size formula: datacache_disk_size × 1.15 (15% filesystem headroom).
+    # StarRocks LRU-evicts at datacache_disk_size; headroom prevents the
+    # filesystem from filling before eviction triggers.
+    #
+    # Current placeholder: 500 GiB cache × 1.15 ≈ 575 GiB PVC.
+    # TBD (Open Decision #7): Resize based on 20–30% of total dataset size.
+    # StorageClass MUST provision NVMe/SSD-backed PVs.
+    storageVolumes:
+      - name:             cn-datacache
+        mountPath:        /opt/starrocks/cn/datacache
+        storageClassName: nvme-storageclass   # TBD: replace with your NVMe StorageClass
+        storageSize:      575Gi               # TBD (Open Decision #7)
+
+    # ─── Vault Agent Injector annotations ──────────────────────────────────
+    # Same pattern as FE: writes /vault/secrets/s3-creds.conf to each CN pod.
+    # TBD: Replace Vault role and KV path with your environment values.
+    annotations:
+      vault.hashicorp.com/agent-inject:           "true"
+      vault.hashicorp.com/agent-init-first:       "true"
+      vault.hashicorp.com/role:                   "starrocks"
+      vault.hashicorp.com/agent-inject-secret-s3: "secret/data/starrocks/s3/credentials"
+      vault.hashicorp.com/agent-inject-template-s3: |
+        {{- with secret "secret/data/starrocks/s3/credentials" -}}
+        aws_s3_access_key = {{ .Data.data.access_key_id }}
+        aws_s3_secret_key = {{ .Data.data.secret_access_key }}
+        {{- end }}
+      vault.hashicorp.com/agent-inject-file-s3: "s3-creds.conf"
+
+    serviceAccount: starrocks
+
+    # Disable HPA — manual scaling via replicas only.
+    autoScalingPolicy: ~
+
+    # ─── Dedicated CN nodes ────────────────────────────────────────────────
+    # REQUIRED node setup before helm install:
+    #   kubectl label node <cn-node-1..7> starrocks/role=cn
+    #   kubectl taint node <cn-node-1..7> starrocks/cn=true:NoSchedule
+    nodeSelector:
+      starrocks/role: cn
+
+    tolerations:
+      - key:      starrocks/cn
+        operator: Exists
+        effect:   NoSchedule
+
+    # ─── Anti-affinity: one CN pod per node (REQUIRED) ─────────────────────
+    # Each CN node needs exclusive access to its NVMe PV.
+    # Also limits the blast radius of a single node failure to 1/7 of CN compute.
+    # Validate label keys with: kubectl -n starrocks get pods --show-labels
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name:      starrocks-production
+                app.kubernetes.io/component: cn

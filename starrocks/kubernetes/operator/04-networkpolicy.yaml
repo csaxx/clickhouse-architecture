@@ -1,0 +1,313 @@
+# NetworkPolicy rules for the StarRocks production deployment
+#
+# Architecture reference: starrocks/kubernetes/starrocks-architecture.md §7.2
+#
+# These policies assume a default-deny posture. Apply a cluster-wide or
+# namespace-scoped default-deny policy BEFORE applying these allow rules.
+#
+# Policies defined here:
+#   1. fe-internal      — FE-to-FE Raft/RPC (ports 9010, 9020)
+#   2. fe-to-cn         — FE → CN dispatch (ports 8040, 9050, 9060)
+#   3. cn-to-fe         — CN → FE reporting/heartbeat (ports 8030, 9020)
+#   4. external-to-fe   — external clients → FE (ports 8030, 9030)
+#   5. starrocks-to-s3  — FE + CN → S3 backend (port 443 or 9000)
+#   6. starrocks-to-vault — FE + CN → Vault (port 8200)
+#   7. starrocks-to-kafka — FE + CN → Redpanda/Kafka (port 9092 or 29092)
+#   8. allow-dns-egress  — all pods → kube-dns (UDP/TCP 53)
+#
+# ─── LABEL SELECTORS ──────────────────────────────────────────────────────────
+# Labels on FE and CN pods are set by the kube-starrocks operator.
+# Expected labels (kube-starrocks >= 1.8):
+#   app.kubernetes.io/name: starrocks-production
+#   app.kubernetes.io/component: fe   (FE pods)
+#   app.kubernetes.io/component: cn   (CN pods)
+#
+# Validate: kubectl -n starrocks get pods --show-labels
+# Update the selectors below if your operator version uses different label keys.
+#
+# ─── S3 BACKEND (Open Decision #1) ───────────────────────────────────────────
+# Update starrocks-to-s3 based on your S3 selection:
+#   Option A — MinIO in-cluster (different namespace):
+#     Replace ipBlock with namespaceSelector + podSelector targeting MinIO pods.
+#   Option B — MinIO or NetApp external to cluster:
+#     Replace 0.0.0.0/0 with the specific CIDR of your S3 endpoint.
+# Current placeholder: 0.0.0.0/0 — RESTRICT before production.
+#
+# ─── KAFKA / REDPANDA ─────────────────────────────────────────────────────────
+# Routine Load requires FE and CN to reach the Redpanda Kafka broker.
+# Adjust the namespaceSelector and port to match your Redpanda deployment.
+# Default Redpanda in-cluster port: 29092 (PLAINTEXT inter-container).
+# Port 9092 is the external advertised port; use 29092 for in-cluster StarRocks.
+
+---
+# ─── 1. FE internal: FE-to-FE Raft/RPC ──────────────────────────────────────
+# Covers:
+#   Port 9010 — edit-log port (follower registration, Raft log replication)
+#   Port 9020 — internal RPC (FE-to-FE queries, Routine Load coordination)
+# All three FE pods must communicate with each other for Raft consensus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fe-internal
+  namespace: starrocks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name:      starrocks-production
+      app.kubernetes.io/component: fe
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name:      starrocks-production
+              app.kubernetes.io/component: fe
+      ports:
+        - protocol: TCP
+          port: 9010    # Raft edit-log / follower registration
+        - protocol: TCP
+          port: 9020    # FE internal RPC
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name:      starrocks-production
+              app.kubernetes.io/component: fe
+      ports:
+        - protocol: TCP
+          port: 9010
+        - protocol: TCP
+          port: 9020
+
+---
+# ─── 2. FE → CN: query dispatch and CN management ────────────────────────────
+# FE must reach CN pods on:
+#   Port 9060 — CN thrift port (query fragment dispatch, tablet assignments)
+#   Port 8040 — CN HTTP port (result fetching, metrics, compaction status)
+#   Port 9050 — CN heartbeat service port (FE monitors CN health)
+# (starrocks-architecture.md §7.2)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fe-to-cn
+  namespace: starrocks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name:      starrocks-production
+      app.kubernetes.io/component: cn
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name:      starrocks-production
+              app.kubernetes.io/component: fe
+      ports:
+        - protocol: TCP
+          port: 9060    # CN thrift port — fragment dispatch
+        - protocol: TCP
+          port: 8040    # CN HTTP port — result fetching, metrics
+        - protocol: TCP
+          port: 9050    # CN heartbeat service port
+
+---
+# ─── 3. CN → FE: heartbeat reporting and result delivery ─────────────────────
+# CN pods report sub-task completion, heartbeat, and deliver query results to FE.
+#   Port 9020 — FE internal RPC (CN reports Routine Load sub-task completion)
+#   Port 8030 — FE HTTP (CN reports query results, health probes)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cn-to-fe
+  namespace: starrocks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name:      starrocks-production
+      app.kubernetes.io/component: cn
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name:      starrocks-production
+              app.kubernetes.io/component: fe
+      ports:
+        - protocol: TCP
+          port: 9020    # FE internal RPC
+        - protocol: TCP
+          port: 8030    # FE HTTP
+
+---
+# ─── 4. External clients → FE ─────────────────────────────────────────────────
+# Allows traffic from any source to reach FE pods on client-serving ports.
+# The LoadBalancer Service in 03-services.yaml routes external traffic here.
+# The Kubernetes Service health-checks ensure failed FE pods are removed
+# from the endpoint slice before clients attempt connections.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: external-to-fe
+  namespace: starrocks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name:      starrocks-production
+      app.kubernetes.io/component: fe
+  policyTypes:
+    - Ingress
+  ingress:
+    # MySQL wire protocol — SQL clients, StarRocks JDBC/ODBC drivers
+    - ports:
+        - protocol: TCP
+          port: 9030
+    # HTTP API — Prometheus metrics, BI tools, health checks, DDL via HTTP
+    - ports:
+        - protocol: TCP
+          port: 8030
+
+---
+# ─── 5. StarRocks (FE + CN) → S3 backend ─────────────────────────────────────
+# FE pods need S3 egress for: storage volume operations, Pipe monitoring.
+# CN pods need S3 egress for: Routine Load writes, Pipe load reads,
+#   query scan (tablet data reads on cache miss), compaction writes.
+# (starrocks-architecture.md §5.1, §7.1, §8.7)
+#
+# TBD (Open Decision #1): Choose ONE option based on your S3 backend:
+#
+# Option A — MinIO in-cluster (example: MinIO in "minio-system" namespace):
+#   Replace the ipBlock section with:
+#     - namespaceSelector:
+#         matchLabels:
+#           kubernetes.io/metadata.name: minio-system
+#       podSelector:
+#         matchLabels:
+#           app: minio
+#
+# Option B — MinIO or NetApp external to cluster:
+#   Replace 0.0.0.0/0 with the specific CIDR of your S3 endpoint IP(s).
+#   Use port 443 for HTTPS, 9000 for plain HTTP (MinIO default).
+#
+# Current: 0.0.0.0/0 — OVERLY PERMISSIVE. Restrict before production.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: starrocks-to-s3
+  namespace: starrocks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: starrocks-production
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0   # TBD (Open Decision #1): restrict to S3 endpoint CIDR
+      ports:
+        - protocol: TCP
+          port: 443            # HTTPS (standard S3-compatible, NetApp)
+        - protocol: TCP
+          port: 9000           # MinIO default HTTP port
+
+---
+# ─── 6. StarRocks (FE + CN) → HashiCorp Vault ────────────────────────────────
+# The Vault Agent init container authenticates to Vault on port 8200.
+# Required by all FE and CN pods that have Vault Agent Injector annotations.
+#
+# If Vault runs outside the cluster, replace podSelector/namespaceSelector
+# with an ipBlock pointing to the Vault server IP(s).
+# (starrocks-architecture.md §7.3)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: starrocks-to-vault
+  namespace: starrocks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: starrocks-production
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault   # TBD: adjust to your Vault namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vault
+      ports:
+        - protocol: TCP
+          port: 8200    # Vault HTTPS API
+
+---
+# ─── 7. StarRocks (FE + CN) → Redpanda/Kafka ─────────────────────────────────
+# FE needs Kafka access for: Routine Load job offset management.
+# CN needs Kafka access for: Routine Load sub-task execution (consuming partitions).
+# (starrocks-architecture.md §4.1)
+#
+# Adjust the namespaceSelector to match your Redpanda/Kafka namespace.
+# Adjust the port to match your Kafka advertised listener:
+#   Port 29092 — Redpanda in-cluster PLAINTEXT listener (default; inter-container)
+#   Port 9092  — Redpanda external listener (use if CN connects via external address)
+#   Port 9092  — Standard Kafka plaintext (non-Redpanda brokers)
+#   Port 9093  — Kafka TLS (if using encrypted Kafka)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: starrocks-to-kafka
+  namespace: starrocks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: starrocks-production
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redpanda   # TBD: adjust to your Kafka namespace
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redpanda        # TBD: adjust to your Kafka pod label
+      ports:
+        - protocol: TCP
+          port: 29092   # Redpanda in-cluster PLAINTEXT listener
+        - protocol: TCP
+          port: 9092    # Kafka standard / Redpanda external listener
+
+---
+# ─── 8. DNS egress (all pods) ────────────────────────────────────────────────
+# Under a default-deny posture, pods cannot resolve DNS without this rule.
+# Covers: Kafka broker hostname, S3 endpoint hostname, Vault hostname,
+#   FE/CN pod FQDNs (used by the operator for registration).
+# kube-dns runs in kube-system on UDP/TCP 53.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: starrocks
+spec:
+  podSelector: {}   # applies to all pods in the starrocks namespace
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

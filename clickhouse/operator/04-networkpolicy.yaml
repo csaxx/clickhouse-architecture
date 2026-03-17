@@ -1,6 +1,6 @@
 # NetworkPolicy rules for the ClickHouse production deployment
 #
-# Architecture reference: docs/architecture.md §7.3
+# Architecture reference: docs/clickhouse-architecture.md §7.3
 #
 # These policies assume a default-deny posture (no NetworkPolicy = allow all in
 # most CNI implementations). Apply a cluster-wide or namespace-scoped default-deny

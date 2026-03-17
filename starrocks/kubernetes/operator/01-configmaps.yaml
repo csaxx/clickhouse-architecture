@@ -1,0 +1,112 @@
+# ConfigMaps for FE and CN configuration
+#
+# These ConfigMaps are referenced by name in values.yaml under
+# starRocksFeSpec.configMapInfo and starRocksComputeNodeSpec.configMapInfo.
+# The Helm chart does NOT create them — they must exist in the namespace before
+# the chart is installed (or the operator will fail to mount the conf files).
+#
+# Apply before running helm install:
+#   kubectl apply -f 00-namespace.yaml
+#   kubectl apply -f 01-configmaps.yaml
+#   helm install ...
+#
+# Architecture reference: starrocks/kubernetes/starrocks-architecture.md §5.2
+#
+# NOTE: Neither ConfigMap contains S3 credentials. Credentials are stored in FE
+# metadata after CREATE STORAGE VOLUME (run by the init Job in 02-init-job.yaml).
+# CN nodes retrieve S3 credentials from FE for all data operations; they do not
+# need them in cn.conf.
+
+---
+# ─── FE non-secret configuration ──────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: starrocks-fe-conf
+  namespace: starrocks
+  labels:
+    app.kubernetes.io/part-of: starrocks-production
+data:
+  fe.conf: |
+    # ─── Shared-data mode ─────────────────────────────────────────────────────
+    # REQUIRED: enables shared-data (CN) mode.
+    # Without run_mode = shared_data, StarRocks starts in shared-nothing mode
+    # and starRocksComputeNodeSpec nodes will not be recognized.
+    run_mode = shared_data
+
+    # REQUIRED: specifies S3 as the cloud-native storage backend.
+    cloud_native_storage_type = S3
+
+    # ─── Network binding ──────────────────────────────────────────────────────
+    # Set to the pod CIDR of your Kubernetes cluster.
+    # Controls which network interface FE binds to.
+    # TBD: Adjust to match your cluster's pod network CIDR.
+    priority_networks = 10.0.0.0/8
+
+    # ─── Port configuration (defaults — listed explicitly for clarity) ─────────
+    http_port = 8030          # FE HTTP API (health checks, DDL via HTTP, metrics)
+    rpc_port = 9020           # FE internal RPC (FE-to-FE and CN-to-FE)
+    query_port = 9030         # MySQL wire protocol (client connections)
+    edit_log_port = 9010      # Raft edit-log port (FE follower registration)
+
+    # ─── JVM heap ─────────────────────────────────────────────────────────────
+    # Must be < pod memory limit (values.yaml: limits.memory = 32Gi) with headroom
+    # for JVM overhead and OS buffers. 16 GiB heap is the recommended starting
+    # point. Increase if FE heap pressure is observed under high query concurrency.
+    JAVA_OPTS = -Xmx16g -Xms16g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+PrintGCDetails -Xloggc:/opt/starrocks/fe/log/fe.gc.log
+
+    # ─── Metadata storage ─────────────────────────────────────────────────────
+    # BDB-JE metadata storage path. Must be on the persistent volume declared
+    # in values.yaml under starRocksFeSpec.storageVolumes[name=fe-meta].mountPath.
+    meta_dir = /opt/starrocks/fe/meta
+
+---
+# ─── CN non-secret configuration ──────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: starrocks-cn-conf
+  namespace: starrocks
+  labels:
+    app.kubernetes.io/part-of: starrocks-production
+data:
+  cn.conf: |
+    # ─── NVMe data cache ──────────────────────────────────────────────────────
+    # Enable local NVMe SSD data cache (transparent acceleration layer for S3).
+    # Hot tablet pages are cached here; cache misses transparently read from S3.
+    # (starrocks-architecture.md §5.1, §5.2)
+    datacache_enable = true
+
+    # Mount path of the NVMe PVC.
+    # MUST match values.yaml: starRocksComputeNodeSpec.storageVolumes[cn-datacache].mountPath
+    datacache_disk_path = /opt/starrocks/cn/datacache
+
+    # TBD (Open Decision #7): Set to match the NVMe PVC size × 0.87 (87% of PVC).
+    # Sizing rule: target 20–30% of total dataset size for the active working set.
+    # PVC size (values.yaml: storageSize) = datacache_disk_size × 1.15.
+    # Current placeholder: 500 GiB = 500000000000 bytes.
+    datacache_disk_size = 500000000000
+
+    # Cache population mode.
+    # "auto": StarRocks opportunistically pre-populates cache on read I/O.
+    # TBD (Open Decision #12): Validate this provides sufficient warmth for
+    # newly ingested data. See starrocks-architecture.md §5.4.
+    datacache_populate_mode = auto
+
+    # ─── Port configuration (defaults — listed explicitly for clarity) ─────────
+    heartbeat_service_port = 9050     # CN heartbeat (FE monitors CN health here)
+    thrift_port = 9060                # CN thrift (FE dispatches query fragments)
+    be_http_port = 8040               # CN HTTP API (result fetching, metrics)
+
+    # ─── Memory limit ─────────────────────────────────────────────────────────
+    # ~85% of pod memory limit (values.yaml: limits.memory = 64Gi).
+    # 85% of 64 GiB = ~54.4 GiB = 58388275200 bytes.
+    # Tune based on observed CN memory pressure during PoC.
+    mem_limit = 58388275200
+
+    # ─── Compaction ───────────────────────────────────────────────────────────
+    # Background compaction thread pool for merging small rowsets (Primary Key model).
+    # Increase to 8 if rowset accumulation is observed under sustained ingest load.
+    # Monitor: SELECT * FROM information_schema.be_compactions;
+    # (starrocks-architecture.md §8.2)
+    max_compaction_threads = 4

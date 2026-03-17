@@ -1,6 +1,6 @@
 # ClickHouse Configuration Reference
 
-Companion document to [architecture.md](architecture.md). Contains annotated DDL templates and server configuration baselines for all table types in this architecture. Placeholders marked **TBD** depend on open questions (see [architecture.md — Open Questions](architecture.md#8-open-questions)) and must be confirmed before YAML authoring begins.
+Companion document to [architecture.md](clickhouse-architecture). Contains annotated DDL templates and server configuration baselines for all table types in this architecture. Placeholders marked **TBD** depend on open questions (see [architecture.md — Open Questions](clickhouse-architecture#8-open-questions)) and must be confirmed before YAML authoring begins.
 
 ## Table of Contents
 
@@ -48,7 +48,7 @@ ENGINE = Replicated(
 );
 ```
 
-> **PoC validation required**: Confirm that Altinity operator 0.26.0+ correctly handles a `Replicated` database — creation on initial deploy, DDL propagation after pod restart, and compatibility with operator-managed `macros` and `remote_servers`. See [Open Question #12](architecture.md#8-open-questions).
+> **PoC validation required**: Confirm that Altinity operator 0.26.0+ correctly handles a `Replicated` database — creation on initial deploy, DDL propagation after pod restart, and compatibility with operator-managed `macros` and `remote_servers`. See [Open Question #12](clickhouse-architecture#8-open-questions).
 
 ---
 
@@ -141,7 +141,7 @@ ENGINE = Distributed(
 );
 ```
 
-**Async vs synchronous inserts**: By default, Distributed INSERTs are buffered locally and sent asynchronously. To make MV→cache INSERTs synchronous — waiting for the cache shard to confirm before the KafkaEngine offset is committed — set the user-level setting `insert_distributed_sync = 1` in the ClickHouse user profile used by the ingest tables. Synchronous inserts eliminate the data-loss window described in [architecture.md §7.4](architecture.md#74-kafkaengine-at-least-once-delivery-risk) but add one network RTT per batch. Measure the throughput impact against the ~29k rows/sec target during PoC before committing to either mode.
+**Async vs synchronous inserts**: By default, Distributed INSERTs are buffered locally and sent asynchronously. To make MV→cache INSERTs synchronous — waiting for the cache shard to confirm before the KafkaEngine offset is committed — set the user-level setting `insert_distributed_sync = 1` in the ClickHouse user profile used by the ingest tables. Synchronous inserts eliminate the data-loss window described in [architecture.md §7.4](clickhouse-architecture#74-kafkaengine-at-least-once-delivery-risk) but add one network RTT per batch. Measure the throughput impact against the ~29k rows/sec target during PoC before committing to either mode.
 
 ### KafkaEngine Table
 
@@ -424,7 +424,7 @@ Delivered as XML drop-in files placed in `/etc/clickhouse-server/config.d/` and 
 
 ## 5. Cache Disk Sizing
 
-The NVMe cache `max_size` is TBD pending resolution of [Open Question #8](architecture.md#8-open-questions) (per-shard data volume and compressed row size). The formula and worked examples below allow sizing once the row size is measured in the PoC.
+The NVMe cache `max_size` is TBD pending resolution of [Open Question #8](clickhouse-architecture#8-open-questions) (per-shard data volume and compressed row size). The formula and worked examples below allow sizing once the row size is measured in the PoC.
 
 ### Sizing Formula
 
@@ -469,7 +469,7 @@ Typical ClickHouse columnar compression for production event schemas: **20–200
                 <type>s3</type>
                 <!-- Shard-specific prefix; {shard} macro populated by operator -->
                 <endpoint>https://minio-endpoint/bucket/clickhouse/cache/shard-{shard}/</endpoint>
-                <!-- Credentials injected by Vault Agent Sidecar into a separate config.d file; see architecture.md §6.4 -->
+                <!-- Credentials injected by Vault Agent Sidecar into a separate config.d file; see clickhouse-architecture.md §6.4 -->
                 <use_environment_credentials>false</use_environment_credentials>
             </s3_main>
             <nvme_cache>

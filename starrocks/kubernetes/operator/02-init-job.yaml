@@ -1,0 +1,241 @@
+# StarRocks Init Job — storage volume and cluster initialization
+#
+# Architecture reference: starrocks/kubernetes/starrocks-architecture.md §3.3, §7.3
+#
+# This Job runs once after the StarRocks cluster is healthy and performs:
+#   1. Creates the S3 storage volume (CREATE STORAGE VOLUME) with credentials
+#      from the Kubernetes Secret "starrocks-s3-credentials"
+#   2. Sets the new volume as the default storage volume
+#   3. Enables query profiling globals (optional; remove if not desired)
+#
+# ─── PREREQUISITE: create the Kubernetes Secret before running this Job ────────
+#
+# Option A — Manual (bootstrap or one-off):
+#   kubectl -n starrocks create secret generic starrocks-s3-credentials \
+#     --from-literal=access_key_id=<ACCESS_KEY> \
+#     --from-literal=secret_access_key=<SECRET_KEY>
+#
+# Option B — From Vault (recommended for production):
+#   vault kv get -field=access_key_id  secret/starrocks/s3/credentials > /tmp/ak
+#   vault kv get -field=secret_access_key secret/starrocks/s3/credentials > /tmp/sk
+#   kubectl -n starrocks create secret generic starrocks-s3-credentials \
+#     --from-file=access_key_id=/tmp/ak \
+#     --from-file=secret_access_key=/tmp/sk
+#   rm /tmp/ak /tmp/sk
+#
+# Option C — Vault Secrets Operator (automated rotation):
+#   Deploy a VaultStaticSecret CR that syncs secret/starrocks/s3/credentials
+#   to a Kubernetes Secret named "starrocks-s3-credentials".
+#   See: https://developer.hashicorp.com/vault/docs/platform/k8s/vso
+#
+# ─── OPEN DECISION PLACEHOLDERS ───────────────────────────────────────────────
+# Q1  Replace <S3_ENDPOINT_URL> with your MinIO endpoint (e.g., http://minio:9000)
+#     or NetApp S3 endpoint. See starrocks-architecture.md §3.3.
+# Q9  Replace <S3_BUCKET> with your S3 bucket name (e.g., starrocks-prod).
+#     Note: the path layout becomes s3://<S3_BUCKET>/starrocks/ and is managed
+#     internally by StarRocks — do not share this prefix with other applications.
+# Q1  Set aws_s3_enable_ssl = "true" for HTTPS endpoints (standard S3/NetApp).
+#     Use "false" only for local MinIO without TLS.
+# Q1  Set aws_s3_enable_path_style_access = "true" for MinIO path-style S3 API.
+#     Set "false" for virtual-hosted-style endpoints (standard AWS S3, NetApp).
+#
+# ─── IDEMPOTENCY ──────────────────────────────────────────────────────────────
+# The Job uses CREATE STORAGE VOLUME IF NOT EXISTS and is safe to re-run.
+# Re-running does NOT overwrite an existing storage volume's credentials.
+# To rotate S3 credentials, run ALTER STORAGE VOLUME separately or recreate the
+# Job with DROP STORAGE VOLUME + CREATE STORAGE VOLUME (requires no active tables).
+#
+# ─── RE-RUNNING ───────────────────────────────────────────────────────────────
+# Jobs are not restarted by Kubernetes after completion. To re-run:
+#   kubectl -n starrocks delete job starrocks-init
+#   kubectl -n starrocks apply -f 02-init-job.yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: starrocks-init
+  namespace: starrocks
+  labels:
+    app.kubernetes.io/part-of: starrocks-production
+    app.kubernetes.io/component: init
+  annotations:
+    # Job runs once. Set helm.sh/hook if using Helm (helm.sh/hook: post-install).
+    # Manually re-run if the storage volume needs to be reconfigured.
+    description: "One-time cluster init: creates S3 storage volume and sets cluster defaults"
+spec:
+  # Do not restart on failure — diagnose and re-apply instead.
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of:   starrocks-production
+        app.kubernetes.io/component: init
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: starrocks
+
+      containers:
+        - name: init
+          # mariadb client: MySQL 9.x defaults to caching_sha2_password, which
+          # StarRocks (root user, no password) does not support. MariaDB client
+          # uses mysql_native_password by default — compatible with StarRocks.
+          image: mariadb:11
+
+          env:
+            # ─── FE connection ────────────────────────────────────────────────
+            # kube-starrocks operator creates a ClusterIP Service named
+            # "<cluster-name>-fe-service". Adjust if your operator version uses
+            # a different naming convention.
+            # Validate: kubectl -n starrocks get svc -l app.kubernetes.io/component=fe
+            - name:  FE_HOST
+              value: "starrocks-production-fe-service.starrocks.svc.cluster.local"
+            - name:  FE_MYSQL_PORT
+              value: "9030"
+            - name:  FE_HTTP_PORT
+              value: "8030"
+
+            # ─── S3 backend configuration ────────────────────────────────────
+            # TBD (Open Decision #1): Set the S3 endpoint for your backend.
+            # Examples:
+            #   MinIO in-cluster:    http://minio.minio-system.svc.cluster.local:9000
+            #   MinIO external:      http://<minio-host>:9000
+            #   NetApp StorageGRID:  https://<netapp-s3-endpoint>
+            - name:  S3_ENDPOINT
+              value: "<S3_ENDPOINT_URL>"
+
+            # TBD (Open Decision #1): S3 bucket name.
+            # StarRocks manages its path layout under s3://<bucket>/starrocks/
+            - name:  S3_BUCKET
+              value: "<S3_BUCKET>"
+
+            # TBD: Adjust region for your S3 backend.
+            # MinIO: use "us-east-1" (default; region is ignored by MinIO but required)
+            # NetApp: use the configured region or leave as "us-east-1"
+            - name:  S3_REGION
+              value: "us-east-1"
+
+            # TBD: Set to "true" for HTTPS; "false" for plain HTTP (local MinIO only).
+            - name:  S3_ENABLE_SSL
+              value: "false"
+
+            # TBD: Set to "true" for MinIO path-style API; "false" for virtual-hosted.
+            - name:  S3_PATH_STYLE
+              value: "true"
+
+            # ─── S3 credentials (from Kubernetes Secret) ──────────────────────
+            # Secret must exist before this Job runs. See instructions above.
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: starrocks-s3-credentials
+                  key:  access_key_id
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: starrocks-s3-credentials
+                  key:  secret_access_key
+
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              echo "=== StarRocks Init Job ==="
+              echo "FE: ${FE_HOST}:${FE_MYSQL_PORT}"
+              echo "S3: s3://${S3_BUCKET}/starrocks @ ${S3_ENDPOINT}"
+
+              # ─── Wait for FE HTTP health check ──────────────────────────────
+              echo "Waiting for FE HTTP health endpoint..."
+              until curl -sf "http://${FE_HOST}:${FE_HTTP_PORT}/api/health" > /dev/null 2>&1; do
+                echo "  FE not healthy yet, retrying in 5s..."
+                sleep 5
+              done
+              echo "FE HTTP healthy."
+
+              # ─── Wait for FE MySQL port ──────────────────────────────────────
+              echo "Waiting for FE MySQL port..."
+              until mariadb \
+                  -h "${FE_HOST}" -P "${FE_MYSQL_PORT}" \
+                  -u root --connect-timeout=5 \
+                  -e "SELECT 1" > /dev/null 2>&1; do
+                echo "  FE MySQL not ready, retrying in 5s..."
+                sleep 5
+              done
+              echo "FE MySQL ready."
+
+              # ─── Wait for CN nodes to register ──────────────────────────────
+              # Give CN pods time to start and register with FE.
+              # The operator registers each CN via ALTER SYSTEM ADD COMPUTE NODE.
+              # 7 CNs × ~15s startup time each — 60s is a conservative minimum.
+              echo "Waiting 60s for CN pods to register with FE..."
+              sleep 60
+
+              # Verify CN count
+              CN_COUNT=$(mariadb \
+                -h "${FE_HOST}" -P "${FE_MYSQL_PORT}" \
+                -u root --connect-timeout=10 -BNe \
+                "SHOW COMPUTE NODES" 2>/dev/null | wc -l || echo 0)
+              echo "Registered CN nodes: ${CN_COUNT}"
+              if [ "${CN_COUNT}" -lt 1 ]; then
+                echo "WARNING: No CN nodes registered yet. Storage volume will still be created."
+                echo "  If Routine Load or queries fail, verify CN registration:"
+                echo "  SHOW COMPUTE NODES;"
+              fi
+
+              # ─── Create S3 storage volume ────────────────────────────────────
+              echo "Creating S3 storage volume..."
+              mariadb \
+                -h "${FE_HOST}" -P "${FE_MYSQL_PORT}" \
+                -u root --connect-timeout=10 << SQL
+
+              -- Storage volume: S3-compatible backend (MinIO or NetApp).
+              -- Credentials are stored in FE BDB-JE metadata.
+              -- CN nodes retrieve credentials from FE for all S3 data operations.
+              -- (starrocks-architecture.md §3.3, §7.3)
+              CREATE STORAGE VOLUME IF NOT EXISTS s3_volume
+              TYPE = S3
+              LOCATIONS = ('s3://${S3_BUCKET}/starrocks')
+              PROPERTIES (
+                  "enabled"                      = "true",
+                  "aws.s3.region"                = "${S3_REGION}",
+                  "aws.s3.endpoint"              = "${S3_ENDPOINT}",
+                  "aws.s3.access_key"            = "${S3_ACCESS_KEY}",
+                  "aws.s3.secret_key"            = "${S3_SECRET_KEY}",
+                  "aws.s3.enable_ssl"            = "${S3_ENABLE_SSL}",
+                  "aws.s3.enable_path_style_access" = "${S3_PATH_STYLE}"
+              );
+
+              SQL
+              echo "Storage volume creation attempted (IF NOT EXISTS — safe to re-run)."
+
+              # ─── Set as default storage volume ──────────────────────────────
+              echo "Setting s3_volume as default storage volume..."
+              mariadb \
+                -h "${FE_HOST}" -P "${FE_MYSQL_PORT}" \
+                -u root --connect-timeout=10 \
+                -e "SET s3_volume AS DEFAULT STORAGE VOLUME;"
+              echo "Default storage volume set."
+
+              # ─── Enable query profiling ──────────────────────────────────────
+              echo "Enabling global query profiling..."
+              mariadb \
+                -h "${FE_HOST}" -P "${FE_MYSQL_PORT}" \
+                -u root --connect-timeout=10 \
+                -e "SET GLOBAL enable_profile = true; SET GLOBAL pipeline_profile_level = 1;"
+              echo "Query profiling enabled."
+
+              # ─── Verification ────────────────────────────────────────────────
+              echo "Verifying storage volume..."
+              mariadb \
+                -h "${FE_HOST}" -P "${FE_MYSQL_PORT}" \
+                -u root --connect-timeout=10 \
+                -e "SHOW STORAGE VOLUMES;"
+
+              echo ""
+              echo "=== StarRocks Init complete ==="
+              echo "Next steps:"
+              echo "  1. Apply 03-services.yaml and 04-networkpolicy.yaml"
+              echo "  2. Run DDL from starrocks/sql/ in order (01 through 07)"
+              echo "  3. Run PoC validation checklist (see README.md)"

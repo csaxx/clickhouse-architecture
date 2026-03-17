@@ -3,7 +3,7 @@
 # Altinity operator 0.26.0+
 # CRD: clickhouse-keeper.altinity.com/v1alpha1
 #
-# Architecture reference: docs/architecture.md §3.1, §6.2, §8.5
+# Architecture reference: docs/clickhouse-architecture.md §3.1, §6.2, §8.5
 #
 # Open Decision #3: CHKI CRD is used here. If you must use a standalone StatefulSet
 # instead (e.g., operator version does not support CHKI), replace this manifest with
@@ -23,7 +23,7 @@
 # Pod anti-affinity below enforces one Keeper pod per node.
 # Do NOT co-locate Keeper pods with ClickHouse server pods — Keeper is the
 # highest-criticality component; CPU/memory contention can cause quorum instability
-# (architecture.md §8.5).
+# (clickhouse-architecture.md §8.5).
 
 apiVersion: clickhouse-keeper.altinity.com/v1alpha1
 kind: ClickHouseKeeperInstallation

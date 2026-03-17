@@ -3,7 +3,7 @@
 # Altinity operator 0.26.0+
 # CRD: clickhouse.altinity.com/v1
 #
-# Architecture reference: docs/architecture.md
+# Architecture reference: docs/clickhouse-architecture.md
 # Configuration reference: docs/configuration-reference.md
 #
 # ─── PREREQUISITES ────────────────────────────────────────────────────────────
@@ -18,7 +18,7 @@
 # ─── OPEN DECISION PLACEHOLDERS ───────────────────────────────────────────────
 # Q1/Q9  Replace <S3_ENDPOINT_URL> and <S3_BUCKET> with the actual S3 endpoint
 #        and bucket name (finalize before PoC — renaming after data exists requires
-#        a full data migration; architecture.md §9 Decision #9).
+#        a full data migration; clickhouse-architecture.md §9 Decision #9).
 # Q8     Replace 300Gi (nvme-cache-pvc) and 274877906944 (max_size in bytes = 256 GiB)
 #        with values computed from docs/configuration-reference.md §5.
 #        Formula: PVC = nvme_cache_target × 1.15; max_size = nvme_cache_target.
@@ -30,12 +30,12 @@
 # ─── CRITICAL WARNINGS ────────────────────────────────────────────────────────
 # - S3 disk type MUST be "s3" — NOT "s3_plain".
 #   s3_plain uses an immutable layout incompatible with ReplicatedMergeTree merges.
-#   (architecture.md §8.2, §5.4)
+#   (clickhouse-architecture.md §8.2, §5.4)
 # - SharedMergeTree is NOT used. Engine is ReplicatedReplacingMergeTree.
 #   SharedMergeTree is ClickHouse Cloud only; using it on open-source CH produces
-#   "Unknown table engine 'SharedMergeTree'" (architecture.md §8.1).
+#   "Unknown table engine 'SharedMergeTree'" (clickhouse-architecture.md §8.1).
 # - Validate cross-cluster remote_servers auto-generation against your operator
-#   version in the PoC before relying on it in production (architecture.md §7.1).
+#   version in the PoC before relying on it in production (clickhouse-architecture.md §7.1).
 
 apiVersion: clickhouse.altinity.com/v1
 kind: ClickHouseInstallation
@@ -96,7 +96,7 @@ spec:
       # INSERT-level deduplication for ReplicatedMergeTree tables.
       # Tracks recent INSERT block checksums; rejects re-delivered Kafka batches
       # with the same block checksum. Primary guard against KafkaEngine
-      # at-least-once re-delivery duplicating data parts (architecture.md §7.4).
+      # at-least-once re-delivery duplicating data parts (clickhouse-architecture.md §7.4).
       # Do NOT disable.
       default/insert_deduplicate: "1"
 
@@ -491,7 +491,7 @@ spec:
       # Persistent storage + query tier.
       # NVMe write-through cache wrapping S3.
       # Pod anti-affinity is REQUIRED — both replicas of a shard MUST land
-      # on different nodes for HA to hold (architecture.md §3.3, §6.1).
+      # on different nodes for HA to hold (clickhouse-architecture.md §3.3, §6.1).
       # ════════════════════════════════════════════════════════════════════
       - name: cache-pod
         metadata:
@@ -512,7 +512,7 @@ spec:
             #
             # Secret rotation: update the secret in Vault, then send SIGHUP to
             # the clickhouse-server process to reload config without restart.
-            # See architecture.md §7.4 for the full rotation procedure.
+            # See clickhouse-architecture.md §7.4 for the full rotation procedure.
             #
             # TBD: Replace Vault path and role with your environment values.
             vault.hashicorp.com/agent-inject:           "true"

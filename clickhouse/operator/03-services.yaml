@@ -1,6 +1,6 @@
 # Client-facing Services for the cache cluster
 #
-# Architecture reference: docs/architecture.md §4.3, §4.4
+# Architecture reference: docs/clickhouse-architecture.md §4.3, §4.4
 #
 # Decision: Kubernetes Service load balancing is used (chproxy deferred).
 # The Services below target all 14 cache pods via label selector.
@@ -13,7 +13,7 @@
 #
 # Escalation path: if client concurrency causes connection exhaustion on ClickHouse
 # pods, or per-user query routing becomes a requirement, add chproxy in front of
-# these services. See architecture.md §4.4 for the chproxy trade-off analysis.
+# these services. See clickhouse-architecture.md §4.4 for the chproxy trade-off analysis.
 #
 # TLS: not terminated here. Configure a Kubernetes Ingress or external LB in front
 # of clickhouse-cache-http if TLS is required.
