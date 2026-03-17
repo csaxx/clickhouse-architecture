@@ -11,7 +11,7 @@
 --
 -- Pipe replaces both the S3Queue table and its Materialized View with a single
 -- DDL statement. FE monitors the configured S3 path for new files, dispatches
--- load tasks to BEs, and tracks loaded files in FE metadata (BDB-JE) to prevent
+-- load tasks to CNs, and tracks loaded files in FE metadata (BDB-JE) to prevent
 -- double-loading.
 --
 -- File tracking comparison:
@@ -34,7 +34,7 @@
 --   - COLUMNS mapping                 (if source schema differs from events table)
 --   - Source S3 credentials           (if different from the StarRocks data volume)
 --   - poll_interval                   (tune to file arrival frequency)
---   - max_concurrent_tasks            (tune to BE resource availability)
+--   - max_concurrent_tasks            (tune to CN resource availability)
 -- =============================================================================
 
 CREATE PIPE IF NOT EXISTS events_db.events_s3_pipe
@@ -52,9 +52,9 @@ PROPERTIES
     -- Starting point: 60 seconds.
     "poll_interval" = "60",
 
-    -- Number of concurrent file load tasks dispatched to BEs.
+    -- Number of concurrent file load tasks dispatched to CNs.
     -- Equivalent to S3Queue's s3queue_processing_threads_num.
-    -- TBD: tune based on BE resource availability and file arrival rate.
+    -- TBD: tune based on CN resource availability and file arrival rate.
     -- Starting point: 4 concurrent tasks.
     "max_concurrent_tasks" = "4"
 )

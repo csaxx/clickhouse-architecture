@@ -111,20 +111,20 @@ ALTER TABLE events_db.events COMPACT PARTITION p20240115;
 -- Compact all partitions that may contain the deleted user_id rows.
 -- Use when the user_id appears across many partitions (e.g., long retention window).
 -- Warning: compacting all partitions is I/O-intensive and contends with query
--- and Routine Load ingest workloads on BE nodes.
+-- and Routine Load ingest workloads on CN nodes.
 -- Schedule during off-peak hours or apply Resource Group limits (see note below).
 -- ALTER TABLE events_db.events COMPACT;
 
 -- Compact a date range of partitions (more targeted than full-table compact).
 -- Equivalent to running OPTIMIZE TABLE PARTITION FINAL per affected partition
 -- in ClickHouse, but StarRocks compaction is distributed across tablets on
--- all BEs simultaneously — generally faster and more parallelizable.
+-- all CNs simultaneously — generally faster and more parallelizable.
 -- ALTER TABLE events_db.events COMPACT PARTITION START ("p20240101") END ("p20240131");
 
 -- Check compaction progress:
 -- SHOW PROC '/compactions';
 
--- Monitor BE compaction queue:
+-- Monitor CN compaction queue:
 -- SELECT be_id, type, state, candidate_tablets, running_tablets
 -- FROM information_schema.be_compactions;
 

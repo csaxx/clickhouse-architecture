@@ -14,7 +14,7 @@
 --
 -- Storage: shared-data mode with local NVMe data cache.
 --   All writes go to S3 (source of truth). Hot tablet pages are cached on the
---   local NVMe SSD of each BE (datacache_enable = true). This is directly
+--   local NVMe SSD of each CN (datacache_enable = true). This is directly
 --   analogous to ClickHouse's 'cache' disk type wrapping an 's3' disk.
 --
 -- Partitioning: daily by event_date.
@@ -28,13 +28,13 @@
 --   cache_db.cache_distributed  (Distributed query table)
 --   default.cache_writer  (Distributed write table on ingest nodes)
 -- All three are unified into this single table because FE routes both ingest
--- writes (from Routine Load sub-tasks) and query reads (to BEs) automatically.
+-- writes (from Routine Load sub-tasks) and query reads (to CNs) automatically.
 --
 -- TBD values (resolve before production deploy):
 --   - Full payload column list              (application team)
 --   - PRIMARY KEY columns                   (confirm deduplication key — may be composite)
 --   - DISTRIBUTED BY HASH(col)              (Open Decision #5)
---   - BUCKETS count                         (Open Decision #8; default: 21 = 3 × 7 BEs)
+--   - BUCKETS count                         (Open Decision #8; default: 21 = 3 × 7 CNs)
 --   - ORDER BY sort key                     (align with dominant query WHERE / GROUP BY)
 --   - partition_ttl retention period        (compliance/legal team)
 --   - dynamic_partition.start retention     (align with partition_ttl)
@@ -99,28 +99,35 @@ ORDER BY (event_id)
 PARTITION BY RANGE(event_date) ()
 
 -- DISTRIBUTED BY HASH routes rows to tablets by hash of the named column.
--- This determines both Routine Load write distribution across BEs and query
+-- This determines both Routine Load write distribution across CNs and query
 -- parallelism within a partition.
 -- TBD: confirm distribution column (Open Decision #5).
 --   Candidate: user_id (aligns with compliance DELETE and likely query filters)
 --   Candidate: event_id (uniform distribution if UUIDs or monotonic IDs)
--- BUCKETS 21 = 3 × BE count (7 BEs). Rule of thumb: 3× BE count.
+-- BUCKETS 21 = 3 × CN count (7 CNs). Rule of thumb: 3× CN count.
 -- Adjust if partitions are consistently very large (more buckets) or very small
 -- (fewer buckets). See Open Decision #8.
 DISTRIBUTED BY HASH(event_id) BUCKETS 21  -- TBD: replace event_id with confirmed distribution column (Open Decision #5)
 
 PROPERTIES (
     -- Shared-data mode: replication_num = 1 means each tablet is assigned to
-    -- one BE for compute. Data durability comes from S3 (erasure-coded MinIO or
-    -- NetApp), not from BE-level replicas.
+    -- one CN for compute. Data durability comes from S3 (erasure-coded MinIO or
+    -- NetApp), not from CN-level replicas.
     "replication_num" = "1",
 
     -- Reference the storage volume created in 01_storage_volume.sql.
     -- All tablet data for this table is written to that S3 volume.
     "storage_volume" = "s3_volume",
 
-    -- Enable local NVMe data cache on BE nodes for this table.
-    -- Hot tablet pages are cached in the NVMe SSD configured in be.conf
+    -- Persistent Primary Key index stored in S3 (CLOUD_NATIVE), not local disk.
+    -- Required for shared-data / CN mode. Without this, StarRocks falls back to
+    -- LOCAL storage for the index, which defeats the purpose of CN nodes and will
+    -- fail or degrade on pods without persistent local storage.
+    "enable_persistent_index" = "true",
+    "persistent_index_type"   = "CLOUD_NATIVE",
+
+    -- Enable local NVMe data cache on CN nodes for this table.
+    -- Hot tablet pages are cached in the NVMe SSD configured in cn.conf
     -- (datacache_disk_path / datacache_disk_size).
     "datacache_enable" = "true",
 

@@ -31,7 +31,7 @@ Scan this table first to locate the dimensions most relevant to you, then go to 
 
 | Dimension | ClickHouse (this architecture) | StarRocks (this architecture) |
 |---|---|---|
-| **Topology** | 3 concerns: ingest cluster + cache cluster + Keeper | 2 tiers: FE (control) + BE (compute+cache) |
+| **Topology** | 3 concerns: ingest cluster + cache cluster + Keeper | 2 tiers: FE (control) + CN (compute+cache) |
 | **Pod count** | 19–21 pods | 10 pods |
 | **Coordination service** | ClickHouse Keeper (3–5 pods, replaces ZooKeeper) | FE internal (BDB-JE); no separate coordination cluster |
 | **Storage engine / model** | ReplicatedReplacingMergeTree(ver) | PRIMARY KEY table (merge-on-write) |
@@ -40,8 +40,8 @@ Scan this table first to locate the dimensions most relevant to you, then go to 
 | **Kafka ingest** | 3 objects: KafkaEngine table + Materialized View + Distributed table | 1 object: `CREATE ROUTINE LOAD` |
 | **S3 file ingest** | 2 objects: S3Queue table + Materialized View | 1 object: `CREATE PIPE` |
 | **Materialized View approach** | Trigger-based (fires on INSERT); used as ingest pipeline glue | Async refresh jobs; transparent query rewrite (3.x) |
-| **Query coordination** | Distributed table fans out to shards; each shard returns partial results | FE generates MPP query plan; BEs exchange intermediate results |
-| **Horizontal scaling** | Cache resharding: multi-hour manual operation at 5B rows/day | BE addition triggers automatic tablet redistribution |
+| **Query coordination** | Distributed table fans out to shards; each shard returns partial results | FE generates MPP query plan; CNs exchange intermediate results |
+| **Horizontal scaling** | Cache resharding: multi-hour manual operation at 5B rows/day | CN addition triggers automatic tablet redistribution |
 | **Compliance DELETE** | Lightweight delete (logical); rows visible until `OPTIMIZE PARTITION FINAL` | Immediate logical inaccessibility; physical via `ALTER TABLE COMPACT` |
 | **Native UPDATE/UPSERT** | No (workarounds: patch parts, ALTER TABLE UPDATE) | Yes (Primary Key model — first-class operations) |
 | **Zero-copy replication** | `allow_remote_fs_zero_copy_replication = 1`; documented GC data loss risk | Not applicable; shared-data mode has no replica-level replication |
@@ -49,7 +49,7 @@ Scan this table first to locate the dimensions most relevant to you, then go to 
 | **SQL protocol** | Custom ClickHouse SQL; HTTP + native TCP; custom drivers required | MySQL-compatible (port 9030); standard SQL tooling works |
 | **JOIN performance** | Designed for single-table wide-format scans; multi-table JOINs are weak | MPP optimizer handles multi-table JOINs well; colocate joins supported |
 | **Operator** | Altinity Operator 0.26.0+ (mature, battle-tested) | kube-starrocks (less mature; PoC validation required) |
-| **Ingest cluster** | Required (separate 2-pod cluster + Distributed write tables) | Not needed; Routine Load sub-tasks run directly on BE nodes |
+| **Ingest cluster** | Required (separate 2-pod cluster + Distributed write tables) | Not needed; Routine Load sub-tasks run directly on CN nodes |
 | **Function library** | Very large (HLL, bitmap, specialized time-series codecs, string ops) | Smaller but growing; MySQL-standard functions available |
 | **Column compression** | Custom codecs (Delta, DoubleDelta, Gorilla) tuned for time-series | LZ4, Zstd, Snappy; no custom time-series codecs |
 
@@ -100,7 +100,7 @@ StarRocks collapses these three concerns into two tiers:
                                │ tablet assignments, load tasks,
                                │ query plan fragments
 ┌──────────────────────────────▼──────────────────────────────────┐
-│  BE NODES (7 pods)                                              │
+│  CN NODES (7 pods)                                              │
 │  - Tablet storage on S3 (shared-data mode)                      │
 │  - Local NVMe data cache (transparent LRU)                      │
 │  - Routine Load sub-task execution (ingest)                     │
@@ -118,7 +118,7 @@ StarRocks collapses these three concerns into two tiers:
 
 In ClickHouse, you write a `Distributed` table because ClickHouse nodes are independent — they do not know about each other unless you explicitly configure cluster topology and create Distributed tables over it. The `Distributed` engine is the mechanism by which ClickHouse achieves fan-out writes and fan-in query results.
 
-StarRocks has no `Distributed` table concept because the FE is a unified control plane that maintains a global metadata view of all tablets across all BEs. When you write `INSERT INTO events`, the FE already knows which tablets exist, which BEs host them, and routes the write accordingly. When you run a `SELECT`, the FE generates an MPP plan that addresses specific tablets on specific BEs. The routing is transparent and automatic.
+StarRocks has no `Distributed` table concept because the FE is a unified control plane that maintains a global metadata view of all tablets across all CNs. When you write `INSERT INTO events`, the FE already knows which tablets exist, which CNs host them, and routes the write accordingly. When you run a `SELECT`, the FE generates an MPP plan that addresses specific tablets on specific CNs. The routing is transparent and automatic.
 
 This means:
 - No `ON CLUSTER 'cache'` suffix on DDL — FE applies DDL globally.
@@ -131,12 +131,12 @@ This means:
 | Component | ClickHouse | StarRocks |
 |---|---|---|
 | Coordination | 3–5 Keeper pods | 0 (FE internal BDB-JE) |
-| Ingest layer | 2 ingest pods (2 shards × 1 replica) | 0 (Routine Load on BEs) |
-| Storage/compute | 14 cache pods (7 shards × 2 replicas) | 7 BE pods |
+| Ingest layer | 2 ingest pods (2 shards × 1 replica) | 0 (Routine Load on CNs) |
+| Storage/compute | 14 cache pods (7 shards × 2 replicas) | 7 CN pods |
 | Control plane | 0 (no dedicated FE) | 3 FE pods |
 | **Total** | **19–21 pods** | **10 pods** |
 
-The 2× storage pod count in ClickHouse exists because of replica replication. In StarRocks shared-data mode, S3 provides durability; `replication_num = 1` means each tablet is assigned to one BE for compute. There is no BE-to-BE replication.
+The 2× storage pod count in ClickHouse exists because of replica replication. In StarRocks shared-data mode, S3 provides durability; `replication_num = 1` means each tablet is assigned to one CN for compute. There is no CN-to-CN replication.
 
 ---
 
@@ -247,18 +247,18 @@ StarRocks uses different terminology for equivalent concepts:
 | Part | Rowset |
 | Partition (`PARTITION BY`) | Partition (`PARTITION BY RANGE`) |
 | Background merge | Compaction (cumulative + base) |
-| Merge pool / `background_pool_size` | BE compaction threads |
+| Merge pool / `background_pool_size` | CN compaction threads |
 | "Too many parts" problem | "Small file / rowset accumulation" |
 | Part directory in S3 | Tablet segment objects in S3 |
 
-**Tablet** is the key concept that has no direct ClickHouse equivalent. A tablet is the unit of data distribution and compaction within a partition. Each partition has `BUCKETS N` tablets. Tablets from the same partition can reside on different BEs.
+**Tablet** is the key concept that has no direct ClickHouse equivalent. A tablet is the unit of data distribution and compaction within a partition. Each partition has `BUCKETS N` tablets. Tablets from the same partition can reside on different CNs.
 
 ```
 Partition p20240115 (PARTITION BY RANGE(event_date))
-  ├── tablet_0/   ← rows where hash(event_id) % 21 == 0  → assigned to BE-3
-  ├── tablet_1/   ← rows where hash(event_id) % 21 == 1  → assigned to BE-5
+  ├── tablet_0/   ← rows where hash(event_id) % 21 == 0  → assigned to CN-3
+  ├── tablet_1/   ← rows where hash(event_id) % 21 == 1  → assigned to CN-5
   ├── ...
-  └── tablet_20/  ← rows where hash(event_id) % 21 == 20 → assigned to BE-1
+  └── tablet_20/  ← rows where hash(event_id) % 21 == 20 → assigned to CN-1
 ```
 
 Each tablet contains one or more **rowsets** — immutable objects written on INSERT (equivalent to ClickHouse parts). **Compaction** merges rowsets within a tablet into larger rowsets, equivalent to ClickHouse background merges. There are two compaction types:
@@ -269,19 +269,19 @@ Each tablet contains one or more **rowsets** — immutable objects written on IN
 
 ClickHouse distributes data at the **shard level** — each shard (node or node pair) is responsible for a partition of the keyspace. The sharding function (`xxHash64(sharding_column) % shard_count`) is defined at the Distributed table level and determines which node receives each row.
 
-StarRocks distributes at the **tablet level** — within each partition, rows are hashed to tablets by `DISTRIBUTED BY HASH(col)`. Multiple tablets from the same partition live on different BEs. This is a finer-grained distribution model.
+StarRocks distributes at the **tablet level** — within each partition, rows are hashed to tablets by `DISTRIBUTED BY HASH(col)`. Multiple tablets from the same partition live on different CNs. This is a finer-grained distribution model.
 
 Consequences:
 - In ClickHouse, adding a shard requires re-sharding existing data (multi-hour migration at 5B rows/day scale).
-- In StarRocks, adding a BE triggers automatic tablet reassignment — the cluster rebalances without manual data migration.
+- In StarRocks, adding a CN triggers automatic tablet reassignment — the cluster rebalances without manual data migration.
 
 ### Bucket Count Guidance
 
-`DISTRIBUTED BY HASH(event_id) BUCKETS 21` in this architecture uses the rule of thumb: **3 × BE count** (3 × 7 = 21).
+`DISTRIBUTED BY HASH(event_id) BUCKETS 21` in this architecture uses the rule of thumb: **3 × CN count** (3 × 7 = 21).
 
-- Too few buckets: a partition's data is concentrated on fewer BEs; parallelism bottleneck during scans and compaction.
+- Too few buckets: a partition's data is concentrated on fewer CNs; parallelism bottleneck during scans and compaction.
 - Too many buckets: metadata overhead increases; very small tablets reduce scan efficiency.
-- The bucket count is set once at table creation and cannot be changed without a table rebuild — finalize it based on expected partition size and BE count.
+- The bucket count is set once at table creation and cannot be changed without a table rebuild — finalize it based on expected partition size and CN count.
 
 ### Rowset Accumulation ("Small File" Problem)
 
@@ -292,7 +292,7 @@ The StarRocks equivalent of ClickHouse's "too many parts" problem is rowset accu
 | Symptom | `Too many parts in partition` error | Compaction lag; slow queries on affected tablets |
 | Root cause | Too many small INSERTs creating many parts before merge | Too many small rowsets per tablet before compaction |
 | Primary lever | `kafka_max_block_size = 1048576` (1M rows per Kafka batch) | `max_batch_rows = 500000` in Routine Load |
-| Secondary lever | `background_pool_size` | BE compaction thread count |
+| Secondary lever | `background_pool_size` | CN compaction thread count |
 | Monitoring | `SELECT count() FROM system.parts WHERE active` | `SHOW PROC '/compactions'` |
 
 ---
@@ -327,7 +327,7 @@ This write-through behavior ensures newly ingested data is always NVMe-hot, avoi
 S3 backend (primary source of truth)
   s3://bucket/starrocks/{db}/{table}/{partition}/{tablet}/
 
-NVMe data cache (per-BE, transparent LRU layer)
+NVMe data cache (per-CN, transparent LRU layer)
   datacache_disk_path: /data/datacache
   datacache_disk_size: NVMe capacity × cache_fraction
 ```
@@ -341,13 +341,18 @@ In ClickHouse, the `s3` disk is the "real" storage and the `cache` disk wraps it
 StarRocks' default data cache behavior is read-through — NVMe is populated on first read, not on write. Newly ingested data starts cold. The setting `datacache_populate_mode = auto` attempts to populate the cache on writes that are likely to be queried soon, but this is not a strict write-through guarantee and must be validated in PoC.
 
 ```sql
--- StarRocks table-level cache settings (in 03_events_table.sql)
+-- StarRocks table-level settings for shared-data / CN mode (in 03_events_table.sql)
 "datacache_enable" = "true",
-"datacache_partition_duration" = "7 DAY"  -- keep last 7 days' partitions NVMe-hot
+"datacache_partition_duration" = "7 DAY",  -- keep last 7 days' partitions NVMe-hot
+"enable_persistent_index" = "true",
+"persistent_index_type"   = "CLOUD_NATIVE" -- store Primary Key index in S3, not local disk
 ```
 
+**4. Primary Key index must be stored in S3 (`CLOUD_NATIVE`).**
+For `PRIMARY KEY` tables in shared-data mode, `persistent_index_type = CLOUD_NATIVE` stores the Primary Key lookup index in S3 rather than on the CN's local disk. This is required for CN (stateless compute) nodes, which may not have persistent local storage between restarts. Without this property, StarRocks falls back to `LOCAL` index storage — which defeats the purpose of CN nodes and will either fail or produce incorrect behavior on pods without durable local storage. This has no ClickHouse equivalent because ClickHouse's primary index is always embedded in each part's local files.
+
 **3. No replica-level replication.**
-`replication_num = 1` in this architecture means each tablet is assigned to one BE for compute. Durability comes from S3's erasure coding (MinIO) or RAID (NetApp), not from BE-to-BE replication. There is no "zero-copy" concept because there are no replicas.
+`replication_num = 1` in this architecture means each tablet is assigned to one CN for compute. Durability comes from S3's erasure coding (MinIO) or RAID (NetApp), not from CN-to-CN replication. There is no "zero-copy" concept because there are no replicas.
 
 ### Shared-Nothing vs Shared-Data
 
@@ -355,7 +360,7 @@ StarRocks supports two storage modes:
 - **Shared-nothing**: BEs have local SSD/NVMe as primary storage; `replication_num = 3` means 3 BE replicas per tablet; no S3 dependency.
 - **Shared-data**: S3 is primary; NVMe is a cache layer; `replication_num = 1`; horizontal scaling without data migration.
 
-This architecture uses **shared-data** exclusively. The reason: shared-data enables adding BEs without re-distributing existing data (tablets are reassigned lazily from S3). Shared-nothing would require manual tablet rebalancing similar to ClickHouse resharding.
+This architecture uses **shared-data** exclusively. The reason: shared-data enables adding CNs without re-distributing existing data (tablets are reassigned lazily from S3). Shared-nothing would require manual tablet rebalancing similar to ClickHouse resharding.
 
 ### Zero-Copy Replication: Why It Matters and Why It Disappears
 
@@ -365,7 +370,7 @@ This architecture uses **shared-data** exclusively. The reason: shared-data enab
 
 The zero-copy option is attractive for cost (1× S3 storage) but carries documented risk: the Keeper-coordinated GC that cleans up S3 objects for zero-copy parts has a race condition that can result in a replica permanently losing parts — this means data loss, not just performance degradation. ClickHouse Inc. built SharedMergeTree (ClickHouse Cloud only) specifically to replace this mechanism. The risk is significant enough that this architecture marks it as a critical open decision (#12) that must be resolved before YAML authoring.
 
-**StarRocks**: this class of problem does not exist in shared-data mode. There are no replicas. S3 is the single source of truth. There is no GC race because there is no Keeper-coordinated object sharing. Adding or removing BEs does not involve S3 GC coordination — tablet files in S3 are simply re-referenced by the new BE assignment. The zero-copy risk is architecturally eliminated, not mitigated.
+**StarRocks**: this class of problem does not exist in shared-data mode. There are no replicas. S3 is the single source of truth. There is no GC race because there is no Keeper-coordinated object sharing. Adding or removing CNs does not involve S3 GC coordination — tablet files in S3 are simply re-referenced by the new CN assignment. The zero-copy risk is architecturally eliminated, not mitigated.
 
 ---
 
@@ -474,14 +479,14 @@ FROM KAFKA
 | Objects required | 3 (KafkaEngine + MV + Distributed) | 1 (Routine Load job) |
 | Offset management | External (Kafka consumer group, ClickHouse commits offsets) | Internal (FE metadata; FE commits offsets on batch success) |
 | Consumer group collision avoidance | Manual: `kafka_group_name = 'clickhouse_ingest_{shard}'` (`{shard}` macro required) | Automatic: job name used as group name basis |
-| DLQ routing | Automatic: second MV reads `_error` virtual column | Manual: monitoring process polls BE error log files (`ErrorLogUrls` in `SHOW ROUTINE LOAD TASK`) |
+| DLQ routing | Automatic: second MV reads `_error` virtual column | Manual: monitoring process polls CN error log files (`ErrorLogUrls` in `SHOW ROUTINE LOAD TASK`) |
 | Parallelism tuning | Kafka partition count + `kafka_num_consumers` per node | `desired_concurrent_number` (≤ Kafka partition count) |
 | Batch size tuning | `kafka_max_block_size` (rows per MV batch) | `max_batch_rows` (rows per sub-task flush) |
 | "Too many parts" equivalent | `Too many parts` exception | Rowset accumulation; monitor `SHOW PROC '/compactions'` |
 | Cross-cluster write | Required: `default.cache_writer` Distributed INSERT | Not needed: Routine Load writes directly to target table |
 | Column transforms | In MV SELECT clause | In `COLUMNS` clause of Routine Load DDL |
 | Job management | `DETACH/ATTACH TABLE` to pause/resume KafkaEngine | `PAUSE/RESUME ROUTINE LOAD FOR job_name` |
-| Ingest cluster | Required (separate pods) | Not required (sub-tasks run on BEs) |
+| Ingest cluster | Required (separate pods) | Not required (sub-tasks run on CNs) |
 
 ### Function Translation for Column Transforms
 
@@ -662,14 +667,14 @@ For distributed queries, the `Distributed` table fans out the query to individua
 
 ### StarRocks: MPP Volcano Model
 
-StarRocks uses a **Massively Parallel Processing (MPP) Volcano model**. The FE generates a query plan and splits it into **fragments** — independently executable pipeline stages. Fragments are dispatched to BEs for execution; BEs exchange intermediate results via network. The FE coordinates fragment execution and assembles the final result.
+StarRocks uses a **Massively Parallel Processing (MPP) Volcano model**. The FE generates a query plan and splits it into **fragments** — independently executable pipeline stages. Fragments are dispatched to CNs for execution; CNs exchange intermediate results via network. The FE coordinates fragment execution and assembles the final result.
 
 Key differences from ClickHouse's model:
 
 | Aspect | ClickHouse | StarRocks |
 |---|---|---|
 | Within-node execution | Push-based vectorized pipeline | Volcano model + pipeline engine (3.x) |
-| Cross-node execution | Distributed table fan-out; each shard independent | MPP fragments with inter-BE exchange |
+| Cross-node execution | Distributed table fan-out; each shard independent | MPP fragments with inter-CN exchange |
 | Coordinator role | Distributed table host node | FE (dedicated coordinator) |
 | Dedup at query time | `SELECT ... FINAL` (expensive) | Not needed (Primary Key data always deduplicated) |
 | Multi-table JOINs | Poor; requires denormalized wide tables | Well-supported; MPP optimizer handles shuffle joins efficiently |
@@ -677,18 +682,18 @@ Key differences from ClickHouse's model:
 
 ### Colocate Joins
 
-StarRocks supports **colocated joins**: if two tables use the same distribution key and bucket count, their corresponding tablets are co-located on the same BEs. A join on the distribution key can then be executed without shuffling data across BEs — each BE joins its local tablets independently.
+StarRocks supports **colocated joins**: if two tables use the same distribution key and bucket count, their corresponding tablets are co-located on the same CNs. A join on the distribution key can then be executed without shuffling data across CNs — each CN joins its local tablets independently.
 
 This has no direct ClickHouse equivalent. ClickHouse's co-located join (`GLOBAL JOIN` / `LOCAL IN`) is limited; general JOIN performance is a known weakness.
 
 To create co-located tables:
 ```sql
 -- Both tables use same distribution key (user_id) and bucket count (21)
--- StarRocks co-locates matching tablets on the same BEs
+-- StarRocks co-locates matching tablets on the same CNs
 CREATE TABLE events_db.events        DISTRIBUTED BY HASH(user_id) BUCKETS 21 ...;
 CREATE TABLE events_db.user_profiles DISTRIBUTED BY HASH(user_id) BUCKETS 21 ...;
 
--- This join has no network shuffle (BEs join local tablets)
+-- This join has no network shuffle (CNs join local tablets)
 SELECT e.event_id, p.display_name
 FROM events_db.events e
 JOIN events_db.user_profiles p ON e.user_id = p.user_id;
@@ -742,7 +747,7 @@ The Primary Key model treats UPDATE and DELETE as first-class operations with me
 | UPSERT | Native behavior of INSERT on Primary Key | Same as INSERT | New row always replaces stored row |
 | UPDATE | Efficient in-place update via Primary Key lookup | Low per row | No full part rewrite |
 | DELETE | Immediate logical inaccessibility | Low | Rows invisible immediately after DELETE completes |
-| `ALTER TABLE COMPACT` | Distributed compaction across tablets on all BEs | Medium (distributed) | Physical byte removal; parallelizable across tablets |
+| `ALTER TABLE COMPACT` | Distributed compaction across tablets on all CNs | Medium (distributed) | Physical byte removal; parallelizable across tablets |
 
 ### Side-by-Side: Compliance Delete
 
@@ -774,7 +779,7 @@ WHERE user_id = 12345;
 -- Rows are invisible to all queries as soon as this statement completes.
 
 -- Step 2: physical removal (only if SLA requires physical S3 byte removal)
--- Distributed across tablets on all BEs simultaneously
+-- Distributed across tablets on all CNs simultaneously
 ALTER TABLE events_db.events COMPACT PARTITION p20240115;
 -- Optionally compact a range instead of per-partition calls:
 ALTER TABLE events_db.events COMPACT PARTITION START ("p20240101") END ("p20241231");
@@ -782,7 +787,7 @@ ALTER TABLE events_db.events COMPACT PARTITION START ("p20240101") END ("p202412
 
 The key improvement: in ClickHouse, the compliance gap between `DELETE` and physical removal may span hours (OPTIMIZE duration at scale). In StarRocks, logical inaccessibility is immediate — if the compliance SLA is interpreted as "rows must not be queryable," the SLA is satisfied at the moment `DELETE` completes, independent of compaction timing.
 
-Both systems face the same challenge for **physical byte removal** at scale with many partitions: the number of partitions to compact is proportional to the retention window. StarRocks compaction is distributed across tablets on all BEs simultaneously (potentially faster than ClickHouse's serialized per-partition OPTIMIZE), but both require PoC validation at production partition sizes.
+Both systems face the same challenge for **physical byte removal** at scale with many partitions: the number of partitions to compact is proportional to the retention window. StarRocks compaction is distributed across tablets on all CNs simultaneously (potentially faster than ClickHouse's serialized per-partition OPTIMIZE), but both require PoC validation at production partition sizes.
 
 ### UPDATE Example (StarRocks only)
 
@@ -815,7 +820,7 @@ In ClickHouse, the equivalent would be `ALTER TABLE cache_table ON CLUSTER 'cach
 | `MODIFY COLUMN` (type change) | Heavy: rewrites all data for that column across all parts; avoid in production during peak | Light-to-medium depending on type change; check StarRocks docs for specific conversions |
 | `RENAME COLUMN` | Requires RENAME COLUMN (24.x+) or full table DDL in older versions | Supported in recent StarRocks versions |
 | `ON CLUSTER` required | Yes, on every DDL statement | No (FE applies globally) |
-| Propagation | Operator applies DDL to all nodes; replication ensures consistency | FE applies DDL; propagates to BEs via FE metadata |
+| Propagation | Operator applies DDL to all nodes; replication ensures consistency | FE applies DDL; propagates to CNs via FE metadata |
 
 ### Rolling Upgrades
 
@@ -826,8 +831,8 @@ In ClickHouse, the equivalent would be `ALTER TABLE cache_table ON CLUSTER 'cach
 - Altinity 0.26.0+ is a mature operator; rolling upgrade behavior is well-documented.
 
 **StarRocks** (kube-starrocks):
-- Operator performs rolling restart of BE nodes.
-- During BE restart: tablets on the restarting BE are temporarily unavailable; FE reroutes queries to remaining BEs (tablet replicas if `replication_num > 1`; in shared-data mode with `replication_num = 1`, queries to tablets on the restarting BE may fail briefly).
+- Operator performs rolling restart of CN nodes.
+- During CN restart: tablets on the restarting CN are temporarily unavailable; FE reroutes queries to remaining CNs (tablet replicas if `replication_num > 1`; in shared-data mode with `replication_num = 1`, queries to tablets on the restarting CN may fail briefly).
 - FE leader failover during upgrade: if the FE leader pod is restarted, one of the follower FEs becomes the new leader. FE leadership election via BDB-JE; brief pause during leader election.
 - kube-starrocks operator upgrade behavior, FE leader failover timing, and Routine Load behavior during FE restarts must all be validated in PoC.
 
@@ -839,7 +844,7 @@ In ClickHouse, the equivalent would be `ALTER TABLE cache_table ON CLUSTER 'cach
 - Well-supported mechanism.
 
 **StarRocks**:
-- Vault Agent Sidecar writes credentials to FE/BE environment or config files.
+- Vault Agent Sidecar writes credentials to FE/CN environment or config files.
 - `kill -HUP` behavior for reloading S3 credentials is **not guaranteed** across all StarRocks versions.
 - Rolling pod restart may be required to rotate S3 credentials.
 - **PoC must validate credential rotation without full pod restart.**
@@ -855,7 +860,7 @@ In ClickHouse, the equivalent would be `ALTER TABLE cache_table ON CLUSTER 'cach
 | **Query profiling** | `SELECT * FROM system.query_log WHERE type = 'QueryFinish'` | `EXPLAIN <query>` + `information_schema.loads` |
 | **Replication lag** | `SELECT * FROM system.replicas WHERE behind_count > 0` | N/A (shared-data; no replica lag) |
 | **Keeper health** | `SELECT * FROM system.zookeeper WHERE path = '/clickhouse'` | N/A (FE internal; `SHOW PROC '/frontends'`) |
-| **Prometheus scrape** | `/metrics` endpoint on each CH node (port 9363) | FE `/metrics` (port 8080) + BE `/metrics` (port 8040) |
+| **Prometheus scrape** | `/metrics` endpoint on each CH node (port 9363) | FE `/metrics` (port 8080) + CN `/metrics` (port 8040) |
 | **Active queries** | `SELECT * FROM system.processes` | `SHOW PROCESSLIST` |
 | **S3 ingest file state** | `SELECT * FROM system.s3queue_log` | `SELECT * FROM information_schema.pipe_files WHERE pipe_name = 'events_s3_pipe'` |
 | **Partition list** | `SELECT * FROM system.parts WHERE table = 'cache_table' AND active GROUP BY partition` | `SHOW PARTITIONS FROM events_db.events ORDER BY PartitionName` |
@@ -886,7 +891,7 @@ This improves both correctness (no accidental double-counting in aggregations) a
 
 ### 3. Simpler Topology
 
-Three separate concerns in ClickHouse (ingest cluster + cache cluster + external Keeper) become two tiers in StarRocks (FE + BE). Pod count drops from 19–21 to 10. This reduces:
+Three separate concerns in ClickHouse (ingest cluster + cache cluster + external Keeper) become two tiers in StarRocks (FE + CN). Pod count drops from 19–21 to 10. This reduces:
 - Operational surface area (fewer components to monitor, upgrade, and troubleshoot).
 - Failure modes (Keeper quorum loss is a significant incident type in ClickHouse; FE BDB-JE replication is simpler and less operationally demanding).
 - DDL complexity (no `ON CLUSTER` routing; no cross-cluster Distributed tables).
@@ -895,7 +900,7 @@ Three separate concerns in ClickHouse (ingest cluster + cache cluster + external
 
 Adding capacity to the ClickHouse cache cluster requires resharding: adding a new shard and either migrating existing data (multi-hour operation at 5B rows/day) or accepting permanent imbalanced data distribution. This is a planned, disruptive operation.
 
-Adding a BE to StarRocks triggers automatic tablet redistribution. The FE reassigns tablets from existing BEs to the new BE. Existing BEs transfer tablet data (or the new BE reads from S3 directly in shared-data mode). No manual data migration, no table rebuild, no write pause.
+Adding a CN to StarRocks triggers automatic tablet redistribution. The FE reassigns tablets from existing CNs to the new CN. Existing CNs transfer tablet data (or the new CN reads from S3 directly in shared-data mode). No manual data migration, no table rebuild, no write pause.
 
 ### 5. Native UPDATE and DELETE
 
@@ -929,7 +934,7 @@ StarRocks' MPP optimizer is designed for multi-table JOINs. It supports hash joi
 
 ### 10. Colocate Joins
 
-When two tables are distributed by the same key and same bucket count, StarRocks co-locates their tablets on the same BEs. Joins on the co-location key require no network data transfer — each BE joins its local tablet data independently. This significantly reduces join cost for frequently joined table pairs.
+When two tables are distributed by the same key and same bucket count, StarRocks co-locates their tablets on the same CNs. Joins on the co-location key require no network data transfer — each CN joins its local tablet data independently. This significantly reduces join cost for frequently joined table pairs.
 
 ---
 
@@ -939,11 +944,11 @@ An honest assessment of where StarRocks is weaker. These are not disqualifying c
 
 ### 1. Write-Path Overhead (Primary Key Merge-on-Write)
 
-The Primary Key model's deduplication-on-INSERT requires a lookup in the current tablet data for every incoming row that might be a duplicate. At 57,870 rows/sec with a 10–20% duplicate rate, approximately 5,787–11,574 lookup operations per second are required at the BE level.
+The Primary Key model's deduplication-on-INSERT requires a lookup in the current tablet data for every incoming row that might be a duplicate. At 57,870 rows/sec with a 10–20% duplicate rate, approximately 5,787–11,574 lookup operations per second are required at the CN level.
 
 ClickHouse's `ReplicatedReplacingMergeTree` has **zero write-path dedup overhead** — deduplication is entirely deferred to background merge, which runs asynchronously on background threads. High-throughput ingest is not affected by dedup at write time.
 
-The actual overhead of the Primary Key lookup at this ingest rate depends on tablet data size, NVMe cache hit rate, and BE hardware. It must be measured under sustained load in PoC before concluding the Primary Key model handles 57,870 rows/sec within resource budgets.
+The actual overhead of the Primary Key lookup at this ingest rate depends on tablet data size, NVMe cache hit rate, and CN hardware. It must be measured under sustained load in PoC before concluding the Primary Key model handles 57,870 rows/sec within resource budgets.
 
 ### 2. Write-Path NVMe Cache Population
 
@@ -958,11 +963,11 @@ StarRocks' default data cache behavior is read-through: the NVMe cache is popula
 The Altinity Operator for ClickHouse (version 0.26.0+) is a mature, production-hardened tool with extensive documentation, community adoption, and known behavior in upgrade and failure scenarios.
 
 kube-starrocks is a younger operator. The following behaviors must be validated in PoC before production deployment:
-- Rolling upgrade behavior for FE and BE nodes separately.
+- Rolling upgrade behavior for FE and CN nodes separately.
 - FE leader failover timing during pod restart.
 - Routine Load continuity during FE leader failover (do in-flight batches complete or are they dropped?).
-- Vault Agent Sidecar integration for secret injection into FE/BE config.
-- BE scale-out (add BE pod → automatic tablet rebalancing trigger).
+- Vault Agent Sidecar integration for secret injection into FE/CN config.
+- CN scale-out (add CN pod → automatic tablet rebalancing trigger).
 
 ### 4. Pipe Maturity
 
@@ -975,9 +980,9 @@ StarRocks Pipe was introduced in 3.2 (2023). S3Queue in ClickHouse is also relat
 
 ClickHouse's `kafka_handle_error_mode = 'stream'` + `_error` virtual column makes DLQ routing **automatic and built-in**. The DLQ MV (`mv_kafka_dlq`) fires on the same Kafka batch that produces errors; malformed rows are written to the DLQ table in the same transaction as the main ingest. No external process required.
 
-StarRocks Routine Load writes error row details to BE-local error log files. To populate a DLQ table, an external monitoring process must:
+StarRocks Routine Load writes error row details to CN-local error log files. To populate a DLQ table, an external monitoring process must:
 1. Poll `SHOW ROUTINE LOAD TASK FOR job_name` for error log file URLs.
-2. Fetch the error log files from each BE that reported errors.
+2. Fetch the error log files from each CN that reported errors.
 3. Parse the log files and insert error rows into the DLQ table.
 
 This is operationally more complex and introduces a time lag between the error occurrence and DLQ availability.
@@ -1029,7 +1034,7 @@ Use this framework when evaluating StarRocks vs ClickHouse for new projects or m
 
 - **Compliance deletes must be logically inaccessible immediately.** StarRocks DELETE makes rows invisible upon statement completion. ClickHouse lightweight delete requires `OPTIMIZE PARTITION FINAL` to achieve the same — potentially hours later at scale.
 
-- **Horizontal scaling (adding compute) without data migration is required.** Adding a BE triggers automatic tablet redistribution. ClickHouse cache cluster resharding is a multi-hour planned operation.
+- **Horizontal scaling (adding compute) without data migration is required.** Adding a CN triggers automatic tablet redistribution. ClickHouse cache cluster resharding is a multi-hour planned operation.
 
 - **MySQL-compatible SQL and standard tooling are important.** Any MySQL-speaking tool works with StarRocks. ClickHouse requires custom drivers or the HTTP API.
 
@@ -1059,7 +1064,7 @@ Use this framework when evaluating StarRocks vs ClickHouse for new projects or m
 
 - **>10 compliance user-ID deletes per night.** Both systems face the serialization and scaling challenge of physical byte removal across many partitions. The 24h SLA for physical removal must be measured at production partition sizes and realistic nightly batch volumes. StarRocks has an advantage (immediate logical inaccessibility; parallelized compaction), but physical removal timing still requires measurement.
 
-- **>57,870 rows/sec sustained Kafka ingest.** This architecture is designed for ~57,870 rows/sec across 7 BEs (~8,267 rows/sec per BE). Higher rates require validation of both Routine Load sub-task throughput and Primary Key lookup latency under load.
+- **>57,870 rows/sec sustained Kafka ingest.** This architecture is designed for ~57,870 rows/sec across 7 CNs (~8,267 rows/sec per CN). Higher rates require validation of both Routine Load sub-task throughput and Primary Key lookup latency under load.
 
 - **S3-backed primary storage with NVMe cache, requiring consistent query latency on freshly ingested data.** Both systems require PoC validation of cache warmth after ingest. ClickHouse `cache_on_write_operations = 1` provides a stronger guarantee; StarRocks `datacache_populate_mode = auto` must be measured against your actual query latency SLA.
 

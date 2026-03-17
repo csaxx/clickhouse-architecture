@@ -13,19 +13,19 @@
 --   Routine Load does NOT expose error rows as virtual columns for MV routing.
 --   Instead, rows that fail parsing or type conversion are:
 --     1. Counted against max_error_number (job pauses if threshold exceeded).
---     2. Written to a BE-local error log file as tab-separated raw content.
+--     2. Written to a CN-local error log file as tab-separated raw content.
 --     3. The error file URL is exposed in SHOW ROUTINE LOAD TASK (ErrorLogUrls).
 --
 --   This table provides persistent storage for error rows extracted from those
---   BE log files. It is NOT populated automatically — a monitoring process must
---   poll SHOW ROUTINE LOAD TASK, fetch error files from the BE HTTP API, and
+--   CN log files. It is NOT populated automatically — a monitoring process must
+--   poll SHOW ROUTINE LOAD TASK, fetch error files from the CN HTTP API, and
 --   INSERT parsed errors into this table.
 --
 -- Error file retrieval (for the monitoring process):
 --   1. SHOW ROUTINE LOAD TASK FOR events_db.events_kafka_load;
 --      → Inspect the ErrorLogUrls column for each sub-task.
---      → URLs have the form: http://<be-host>:8040/api/_load_error_log?file=<path>
---   2. Fetch: curl "http://<be-host>:8040/api/_load_error_log?file=<path>"
+--      → URLs have the form: http://<cn-host>:8040/api/_load_error_log?file=<path>
+--   2. Fetch: curl "http://<cn-host>:8040/api/_load_error_log?file=<path>"
 --   3. Parse the tab-separated output and INSERT into this table.
 --
 -- Retention: 30 days of error history. Adjust via dynamic_partition.start and
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS events_db.routine_load_errors
 (
     -- Partition key: time the error was captured by the monitoring process.
     -- Not the Kafka message timestamp — use kafka_offset for correlation.
-    captured_at     DATETIME        NOT NULL  COMMENT "Time error was extracted from BE error log",
+    captured_at     DATETIME        NOT NULL  COMMENT "Time error was extracted from CN error log",
 
     -- Routing metadata: which job and sub-task produced the error.
     job_name        VARCHAR(256)    NOT NULL  COMMENT "Routine Load job name",

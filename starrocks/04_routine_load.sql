@@ -13,9 +13,9 @@
 --   StarRocks:  a single CREATE ROUTINE LOAD statement
 --
 -- Architecture:
---   FE creates desired_concurrent_number sub-tasks, each assigned to a BE.
+--   FE creates desired_concurrent_number sub-tasks, each assigned to a CN.
 --   Each sub-task owns a range of Kafka partitions for one batch interval.
---   The BE consumes rows, applies column transforms, writes rowsets to S3 via
+--   The CN consumes rows, applies column transforms, writes rowsets to S3 via
 --   the Primary Key table (merge-on-write dedup happens here), then reports
 --   completion to FE. FE commits the Kafka offsets on success.
 --
@@ -30,7 +30,7 @@
 -- Error handling:
 --   Rows that fail parsing or type conversion are counted against max_error_number.
 --   If the threshold is exceeded the job pauses automatically.
---   Error row details are written to BE-local error log files; paths are visible
+--   Error row details are written to CN-local error log files; paths are visible
 --   in SHOW ROUTINE LOAD TASK (ErrorLogUrls column).
 --   See 05_routine_load_dlq.sql for the companion DLQ table.
 --
@@ -78,7 +78,7 @@ PROPERTIES
     -- Parallelism
     -- -------------------------------------------------------------------------
 
-    -- Number of concurrent sub-tasks. Each sub-task is assigned to one BE and
+    -- Number of concurrent sub-tasks. Each sub-task is assigned to one CN and
     -- owns a non-overlapping range of Kafka partitions.
     -- Cannot exceed the Kafka topic's partition count.
     -- At 57,870 rows/sec total with 6 sub-tasks: each sub-task handles ~9,645 rows/sec.
@@ -92,7 +92,7 @@ PROPERTIES
     -- Max rows per sub-task batch before flushing to S3.
     -- Too small → many small rowsets accumulate per partition (StarRocks "small
     --   file" problem, equivalent to ClickHouse "too many parts").
-    -- Too large → high BE memory usage during batch accumulation.
+    -- Too large → high CN memory usage during batch accumulation.
     --
     -- Sizing estimate:
     --   6 sub-tasks, 10s interval, ~57,870 rows/sec total
